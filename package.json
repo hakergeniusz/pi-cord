@@ -4,6 +4,11 @@
 	"description": "Use the Pi coding agent from Discord or Telegram - OpenClaw-style gateway, built as a Pi extension",
 	"type": "module",
 	"license": "MIT",
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
 	"scripts": {
 		"typecheck": "tsc --noEmit",
 		"start": "bun run src/main.ts",

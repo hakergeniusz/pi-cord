@@ -21,6 +21,15 @@ import { createLogger } from "./util";
 
 const log = createLogger("ext");
 
+/**
+ * Routine, expected states (no config, autostart off, daemon already owns the
+ * bots) are not worth a line in every session's scrollback. They only print
+ * when PI_CORD_DEBUG=1; real errors always log.
+ */
+const debugLog = (...args: unknown[]): void => {
+	if (process.env.PI_CORD_DEBUG === "1") log(...args);
+};
+
 export default function piCord(pi: ExtensionAPI): void {
 	if (process.env.PI_CORD_CHILD) return;
 	if (process.env.PI_CORD_DISABLE === "1") return;
@@ -97,16 +106,16 @@ export default function piCord(pi: ExtensionAPI): void {
 		try {
 			const configPath = findConfigPath();
 			if (!configPath) {
-				log("no config; staying dormant. See config.example.json in the pi-cord repo.");
+				debugLog("no config; staying dormant. See config.example.json in the pi-cord repo.");
 				return;
 			}
 			const h = await ensureHost();
 			if (h.config.autostart === false) {
-				log("autostart disabled in config; use /pi-cord start");
+				debugLog("autostart disabled in config; use /pi-cord start");
 				return;
 			}
 			if (!hasAnyToken(h.config)) {
-				log("config has no bot tokens; staying dormant");
+				debugLog("config has no bot tokens; staying dormant");
 				return;
 			}
 			// A standalone gateway (systemd service or manual runner) owns the bots;
@@ -114,7 +123,7 @@ export default function piCord(pi: ExtensionAPI): void {
 			const { readGatewayLock } = await import("./lock");
 			const held = readGatewayLock();
 			if (held) {
-				log(`gateway already running (pid ${held.pid}, e.g. the systemd service) — this pi session will not start its own bots`);
+				debugLog(`gateway already running (pid ${held.pid}, e.g. the systemd service) — this pi session will not start its own bots`);
 				return;
 			}
 			await h.start();
