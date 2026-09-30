@@ -1,0 +1,21 @@
+{
+	"$schema_note": "Copy to ~/.pi/agent/pi-cord/config.json and fill in. chmod 600 recommended. See README for details.",
+	"autostart": true,
+	"piPath": "pi",
+	"model": null,
+	"thinking": null,
+	"cwd": "~/.pi/agent/pi-cord/workspace",
+	"childExtensions": false,
+	"trustProject": true,
+	"progressUpdates": true,
+	"childIdleMinutes": 30,
+	"childArgs": [],
+	"discord": {
+		"token": "PASTE_DISCORD_BOT_TOKEN",
+		"allowedUsers": []
+	},
+	"telegram": {
+		"token": "PASTE_TELEGRAM_BOT_TOKEN",
+		"allowedUsers": []
+	}
+}
