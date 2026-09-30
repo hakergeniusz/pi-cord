@@ -115,7 +115,6 @@ export default function piCord(pi: ExtensionAPI): void {
 			const held = readGatewayLock();
 			if (held) {
 				log(`gateway already running (pid ${held.pid}, e.g. the systemd service) — this pi session will not start its own bots`);
-				if (ctx.hasUI) ctx.ui.setStatus("pi-cord", `🤖 via service (pid ${held.pid})`);
 				return;
 			}
 			await h.start();
