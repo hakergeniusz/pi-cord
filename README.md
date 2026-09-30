@@ -25,7 +25,7 @@ Discord / Telegram
 - **Queued messages**: messages sent while the agent runs are queued, not lost.
 - **Images**: attach photos/screenshots; they're passed to the model.
 - **Interruptible**: `/stop` aborts the current run and returns the partial answer.
-- **Two run modes**: as a Pi extension (bots live inside your interactive `pi`), or standalone (`bun run src/main.ts`) with no TUI at all.
+- **Runs as a systemd user service** — no interactive pi required and no tmux: the daemon spawns per-chat `pi --mode rpc` children on demand, restarts on failure, and picks up config changes live. (Also usable manually, or as a Pi extension inside your interactive pi.)
 
 ## Security model (read this)
 
@@ -80,26 +80,33 @@ Config lookup order: `$PI_CORD_CONFIG` → `~/.pi/agent/pi-cord/config.json` →
 
 ### 4. Run it
 
-**As a Pi extension** (bots start with your pi session):
+**As a systemd user service (recommended).** No running pi instance, no tmux — the daemon starts on login (survives logout with lingering), restarts itself on crashes, and reloads the config when you edit it:
 
 ```bash
-ln -s ~/pi-cord/src ~/.pi/agent/extensions/pi-cord
-pi            # in any terminal; keep it open (tmux is fine)
+cp systemd/pi-cord.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now pi-cord
+journalctl --user -u pi-cord -f          # watch it work
+```
+
+Service management: `systemctl --user start|stop|restart|status pi-cord`. Editing `~/.pi/agent/pi-cord/config.json` (e.g. adding an allowlisted user) is picked up automatically within ~10s — the gateway restarts, chat history persists. The daemon stays healthy even before the config exists; it idles and starts the bots once you add tokens. Enable lingering once so it runs without an active login: `loginctl enable-linger $USER`.
+
+**Manually** (same daemon, foreground):
+
+```bash
+bun run ~/pi-cord/src/main.ts            # or: npx tsx src/main.ts on node >= 20
+bun run ~/pi-cord/src/main.ts --diag     # config summary (no secrets), pi path check
+```
+
+**As a Pi extension** (optional): the bots then live inside your interactive `pi` session:
+
+```bash
+ln -s ~/pi-cord/src ~/.pi/agent/extensions/pi-cord   # already installed by default
+pi
 /pi-cord status
 ```
 
-- `/pi-cord start|stop|status|diag` controls the gateway from the TUI.
-- `session_shutdown` stops the bots cleanly when pi exits. Crash of the TUI kills the bots (restart pi).
-- Config with `autostart: true` + tokens starts the bots on every session start. `PI_CORD_DISABLE=1` disables the extension entirely.
-
-**Standalone** (no TUI needed):
-
-```bash
-bun run ~/pi-cord/src/main.ts            # or: npm/global node >= 20: npx tsx src/main.ts
-bun run ~/pi-cord/src/main.ts --diag     # print config summary (no secrets), check pi path
-```
-
-Run it under tmux/systemd/supervisor for a permanent OpenClaw-style setup.
+**One gateway at a time**: a pid-based lock (`~/.pi/agent/pi-cord/gateway.lock`) means the extension inside an interactive pi automatically defers when the service is running (and vice versa) — no double Telegram polling (409) or double Discord logins. `/pi-cord start` in the TUI will tell you which pid owns the bots.
 
 ## Using it
 
@@ -164,11 +171,13 @@ Architecture: `src/gateway.ts` (adapters + chat map, per-chat serialization, dia
 
 ## Troubleshooting
 
-- **Bot silent**: check `/pi-cord status` in the TUI or `main.ts --diag`; is the allowlist still empty (everything denied by design)?
+- **Bot silent**: `bun run src/main.ts --diag` — is the allowlist still empty (everything denied by design)?
+- **Service logs**: `journalctl --user -u pi-cord -f` (this is where pi-cord logs and chat-session stderr tails go).
 - **Discord: no messages seen**: you didn't enable the **MESSAGE CONTENT INTENT**, or the bot lacks View/Send permissions in that channel.
-- **Telegram: `409 Conflict`**: another process is long-polling the same token (e.g. a second pi-cord instance or a devtools session). Stop one.
-- **Chat replies stop mid-way**: run `/pi-cord status` and check the pi child's stderr tail in the pi-cord logs (stderr of your pi process / runner).
+- **Telegram: `409 Conflict`**: another process is long-polling the same token. pi-cord's own lock prevents its duplicates (extension defers to the service); look for a second bot instance outside pi-cord.
+- **Chat replies stop mid-way**: check the journal for the child's stderr tail; run `/pi-cord status` in the chat or TUI.
 - **Model errors**: chat sessions use your `~/.pi` auth — run `pi auth` to check providers, or set `model` in the config.
+- **Service not running after logout**: `loginctl enable-linger $USER` (needs to be set once).
 
 ## Limitations / notes
 

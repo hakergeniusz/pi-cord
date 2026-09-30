@@ -3,6 +3,7 @@ import type { ChatAdapter, DialogAnswer, DialogRequest, Incoming } from "./types
 import { ChatAgent } from "./chat";
 import { handleMessage, isAllowed } from "./commands";
 import { hasAnyToken, loadConfig, resolvePiPath, type PiCordConfig } from "./config";
+import { acquireGatewayLock, readGatewayLock } from "./lock";
 import { StateStore } from "./state";
 import { createLogger, expandTilde } from "./util";
 
@@ -33,6 +34,7 @@ export class GatewayHost {
 	private readonly pendingDialogs = new Map<string, PendingDialog>();
 	private reaper: ReturnType<typeof setInterval> | null = null;
 	private running = false;
+	private releaseLock: (() => void) | null = null;
 	readonly state: StateStore;
 	readonly config: PiCordConfig;
 	readonly configPath: string;
@@ -75,6 +77,12 @@ export class GatewayHost {
 				`No bot tokens configured. Edit ${this.configPath} (see config.example.json) or set PI_CORD_TELEGRAM_TOKEN / PI_CORD_DISCORD_TOKEN.`,
 			);
 		}
+		const release = acquireGatewayLock();
+		if (!release) {
+			const held = readGatewayLock();
+			throw new Error(`Another pi-cord gateway is already running (pid ${held?.pid}). Stop it first: systemctl --user stop pi-cord`);
+		}
+		this.releaseLock = release;
 
 		if (this.config.telegram?.token) {
 			const { TelegramAdapter } = await import("./telegram");
@@ -128,7 +136,10 @@ export class GatewayHost {
 		}
 		this.adapters = [];
 		for (const chat of this.chats.values()) await chat.shutdown().catch(() => {});
+		this.chats.clear();
 		this.state.flush();
+		this.releaseLock?.();
+		this.releaseLock = null;
 		log("stopped");
 	}
 

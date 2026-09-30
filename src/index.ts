@@ -109,6 +109,15 @@ export default function piCord(pi: ExtensionAPI): void {
 				log("config has no bot tokens; staying dormant");
 				return;
 			}
+			// A standalone gateway (systemd service or manual runner) owns the bots;
+			// never fight it for the Telegram long-poll / Discord login.
+			const { readGatewayLock } = await import("./lock");
+			const held = readGatewayLock();
+			if (held) {
+				log(`gateway already running (pid ${held.pid}, e.g. the systemd service) — this pi session will not start its own bots`);
+				if (ctx.hasUI) ctx.ui.setStatus("pi-cord", `🤖 via service (pid ${held.pid})`);
+				return;
+			}
 			await h.start();
 			if (ctx.hasUI) {
 				ctx.ui.setStatus("pi-cord", `🤖 ${h.status().adapters.map((a) => a.platform).join("+")}`);

@@ -1,0 +1,24 @@
+[Unit]
+Description=pi-cord - Pi coding agent gateway for Discord/Telegram
+Documentation=https://github.com/hakergeniusz/pi-cord
+# Runs the bots without any interactive pi and without tmux; per-chat
+# `pi --mode rpc` children are spawned on demand.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/pi-cord
+ExecStart=/usr/sbin/bun run %h/pi-cord/src/main.ts
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+# The daemon idles (exit 0) when the config has no tokens yet; that is healthy.
+SuccessExitStatus=0
+Environment=PI_CORD_CONFIG=%h/.pi/agent/pi-cord/config.json
+# Make sure the pi CLI used for chat sessions is reachable.
+Environment=PATH=%h/.npm-global/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin
+UMask=0077
+
+[Install]
+WantedBy=default.target
