@@ -5,6 +5,8 @@ export interface ChatState {
 	sessionFile?: string;
 	/** Per-chat working directory override. */
 	cwd?: string;
+	/** Hashes of info-level notifications already delivered to this chat (dedupe). */
+	seenNotifies?: string[];
 }
 
 export interface PiCordState {
@@ -55,6 +57,17 @@ export class StateStore {
 	setChatCwd(key: string, cwd: string): void {
 		this.chat(key).cwd = cwd;
 		this.scheduleSave();
+	}
+
+	/** Record an info notify as delivered; returns true when that text was already sent to this chat. */
+	hasSeenNotify(key: string, hash: string): boolean {
+		const c = this.chat(key);
+		const seen = c.seenNotifies ?? (c.seenNotifies = []);
+		if (seen.includes(hash)) return true;
+		seen.push(hash);
+		if (seen.length > 100) seen.splice(0, seen.length - 100);
+		this.scheduleSave();
+		return false;
 	}
 
 	flush(): void {

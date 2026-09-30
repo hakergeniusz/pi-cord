@@ -12,6 +12,18 @@ export interface TelegramConfig {
 	allowedUsers: string[];
 }
 
+/** Policy for fire-and-forget extension notifications (ctx.ui.notify) mirrored into the chat. */
+export interface NotifyConfig {
+	/**
+	 * How info-level notifies are delivered: "all" sends every one, "once"
+	 * (default) sends only the first of each distinct text per chat, "off"
+	 * never sends them. warning/error notifies always come through.
+	 */
+	info?: "all" | "once" | "off";
+	/** Never forward a notification whose message contains any of these substrings. */
+	suppress?: string[];
+}
+
 export interface PiCordConfig {
 	/** Start the bots automatically when a pi session starts. Default true. */
 	autostart?: boolean;
@@ -33,6 +45,8 @@ export interface PiCordConfig {
 	dialogTimeoutSeconds?: number;
 	/** Mirror fire-and-forget extension notifications (ctx.ui.notify) into the chat. Default true. */
 	forwardNotifications?: boolean;
+	/** Delivery policy for those notifications (dedupe/suppress). See NotifyConfig. */
+	notify?: NotifyConfig;
 	/** Live tool-activity edits on the status message. Default true. */
 	progressUpdates?: boolean;
 	/** Shut down an idle child after this many minutes. Default 30. */

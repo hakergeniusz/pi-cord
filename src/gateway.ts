@@ -1,4 +1,5 @@
 import { join, dirname } from "node:path";
+import { createHash } from "node:crypto";
 import type { ChatAdapter, DialogAnswer, DialogRequest, Incoming } from "./types";
 import { ChatAgent } from "./chat";
 import { handleMessage, isAllowed } from "./commands";
@@ -189,11 +190,18 @@ export class GatewayHost {
 
 	// ---- interactive dialog & notification forwarding -----------------------
 
+	/** Adapter for a chat key, or undefined when that platform isn't running (e.g. mid-shutdown). */
+	private adapterForChat(key: string): ChatAdapter | undefined {
+		const platform = key.startsWith("discord:") ? "discord" : "telegram";
+		return this.adapters.find((a) => a.platform === platform);
+	}
+
 	/** Present a child's extension dialog in the chat; resolves with the answer or cancellation on timeout. */
 	private async forwardDialog(key: string, chatId: string, req: DialogRequest): Promise<DialogAnswer> {
 		const cfg = this.config;
 		if (cfg.interactiveDialogs === false) return { cancelled: true };
-		const adapter = this.adapterFor(key.startsWith("discord:") ? "discord" : "telegram");
+		const adapter = this.adapterForChat(key);
+		if (!adapter) return { cancelled: true };
 		const timeoutMs = (cfg.dialogTimeoutSeconds ?? 180) * 1000;
 		const effective = req.timeoutMs ? Math.min(req.timeoutMs, timeoutMs) : timeoutMs;
 
@@ -239,11 +247,23 @@ export class GatewayHost {
 
 	private forwardNotify(key: string, chatId: string, message: string, notifyType: string): void {
 		if (this.config.forwardNotifications === false) return;
+		const policy = this.config.notify;
+		if (policy?.suppress?.some((pattern) => message.includes(pattern))) return;
+		// Unknown levels display as info; both follow the info policy so repeat
+		// banners (e.g. extension startup notices) don't spam every run.
+		if (!notifyType || notifyType === "info" || !NOTIFY_ICON[notifyType]) {
+			const mode = policy?.info ?? "once";
+			if (mode === "off") return;
+			if (mode === "once") {
+				const hash = createHash("sha1").update(message).digest("hex").slice(0, 16);
+				if (this.state.hasSeenNotify(key, hash)) return;
+			}
+		}
 		const icon = NOTIFY_ICON[notifyType] ?? "ℹ️";
 		const text = `${icon} ${message}`;
-		this.adapterFor(key.startsWith("discord:") ? "discord" : "telegram")
-			.send(chatId, text.length > 500 ? `${text.slice(0, 499)}…` : text)
-			.catch(() => {});
+		const adapter = this.adapterForChat(key);
+		if (!adapter) return;
+		adapter.send(chatId, text.length > 500 ? `${text.slice(0, 499)}…` : text).catch(() => {});
 	}
 
 	adapterFor(platform: Incoming["platform"]): ChatAdapter {

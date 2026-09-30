@@ -151,6 +151,8 @@ you:  /stop          (anytime — also cancels open dialogs)
 | `interactiveDialogs` | `true` | forward extension dialogs into the chat as buttons/replies |
 | `dialogTimeoutSeconds` | `180` | cancel a chat dialog after this long (never longer than the extension's own timeout) |
 | `forwardNotifications` | `true` | mirror `ctx.ui.notify` messages from extensions into the chat |
+| `notify.info` | `"once"` | info-notify policy: `"all"`, `"once"` (first of each distinct text per chat — stops repeat banners like extension startup notices), or `"off"`. warning/error always come through |
+| `notify.suppress` | `[]` | never forward a notification whose message contains one of these substrings, e.g. `["Multi-account loaded"]` |
 | `progressUpdates` | `true` | edit the status message with tool activity |
 | `childIdleMinutes` | `30` | shut down an idle chat session after N minutes |
 | `childArgs` | `[]` | extra CLI args for every chat session |

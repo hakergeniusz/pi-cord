@@ -10,6 +10,10 @@
 	"interactiveDialogs": true,
 	"dialogTimeoutSeconds": 180,
 	"forwardNotifications": true,
+	"notify": {
+		"info": "once",
+		"suppress": []
+	},
 	"progressUpdates": true,
 	"childIdleMinutes": 30,
 	"childArgs": [],

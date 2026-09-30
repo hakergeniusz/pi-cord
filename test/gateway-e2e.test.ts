@@ -82,12 +82,13 @@ class MockAdapter {
 	}
 }
 
-function makeHost(dir: string): { host: GatewayHost; adapter: MockAdapter } {
+function makeHost(dir: string, extra?: Partial<PiCordConfig>): { host: GatewayHost; adapter: MockAdapter } {
 	const config: PiCordConfig = {
 		piPath: FAKE_PI,
 		cwd: join(dir, "workspace"),
 		progressUpdates: true,
 		discord: { token: "unused-by-mock", allowedUsers: ["user-1"] },
+		...extra,
 	};
 	const host = new GatewayHost(config, join(dir, "config.json"), join(dir, "state.json"));
 	const adapter = new MockAdapter();
@@ -236,5 +237,58 @@ describe("gateway end-to-end with fake pi", () => {
 		await adapter.lastReply();
 		expect(adapter.sentTo("chan-1")).toContain("ℹ️ Background job finished");
 		await host.stop();
+	}, 30_000);
+
+	test("repeated info notifies are deduped per chat and survive a restart", async () => {
+		const dir = freshDir();
+		const runOnce = async (host: GatewayHost, adapter: MockAdapter) => {
+			await host.addAdapter(adapter);
+			await adapter.inject({ text: "notify me when done" });
+			await adapter.lastReply();
+			await host.stop();
+		};
+		const { host, adapter } = makeHost(dir);
+		await runOnce(host, adapter);
+		expect(adapter.sentTo("chan-1").filter((t) => t === "ℹ️ Background job finished").length).toBe(1);
+
+		// a fresh gateway on the same state must not repeat the banner
+		const again = makeHost(dir);
+		await runOnce(again.host, again.adapter);
+		expect(again.adapter.sentTo("chan-1").filter((t) => t === "ℹ️ Background job finished").length).toBe(0);
+	}, 30_000);
+
+	test("notify.suppress silences matching banners entirely", async () => {
+		const dir = freshDir();
+		const { host, adapter } = makeHost(dir, { notify: { suppress: ["Background job"] } });
+		await host.addAdapter(adapter);
+		await adapter.inject({ text: "notify me when done" });
+		await adapter.lastReply();
+		expect(adapter.sentTo("chan-1").some((t) => t.includes("Background job"))).toBe(false);
+		await host.stop();
+	}, 30_000);
+
+	test("notify.info 'all' forwards every occurrence, 'off' none", async () => {
+		const dir = freshDir();
+		const runTwice = async (host: GatewayHost, adapter: MockAdapter) => {
+			await host.addAdapter(adapter);
+			for (let i = 0; i < 2; i++) {
+				// wait for a NEW echo: delivered() accumulates across runs
+				const echoesBefore = adapter.delivered("chan-1").filter((t) => t.startsWith("Echo:")).length;
+				await adapter.inject({ text: "notify me when done" });
+				for (let j = 0; j < 200; j++) {
+					const echoesNow = adapter.delivered("chan-1").filter((t) => t.startsWith("Echo:")).length;
+					if (echoesNow > echoesBefore) break;
+					await new Promise((r) => setTimeout(r, 100));
+				}
+			}
+			await host.stop();
+		};
+		const all = makeHost(dir, { notify: { info: "all" } });
+		await runTwice(all.host, all.adapter);
+		expect(all.adapter.sentTo("chan-1").filter((t) => t === "ℹ️ Background job finished").length).toBe(2);
+
+		const off = makeHost(dir, { notify: { info: "off" } });
+		await runTwice(off.host, off.adapter);
+		expect(off.adapter.sentTo("chan-1").some((t) => t.includes("Background job"))).toBe(false);
 	}, 30_000);
 });
