@@ -32,9 +32,19 @@ let buffer = "";
 let lastPrompt = "";
 let lastFinal = "";
 let aborted = false;
+let steeredMessages = [];
 
 function send(obj) {
 	process.stdout.write(JSON.stringify(obj) + "\n");
+}
+
+/** Emit a message_update with a cumulative assistant snapshot (like real pi). */
+function emitUpdate(text, delta) {
+	send({
+		type: "message_update",
+		message: { role: "assistant", content: [{ type: "text", text }], stopReason: "pending" },
+		assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: delta ?? text },
+	});
 }
 
 function respond(id, command, success, data) {
@@ -88,6 +98,7 @@ function state() {
 
 function runAgent() {
 	aborted = false;
+	steeredMessages = [];
 	send({ type: "agent_start" });
 	send({ type: "turn_start" });
 	send({ type: "message_start", message: { role: "user", content: lastPrompt, timestamp: Date.now() } });
@@ -113,17 +124,15 @@ function runAgent() {
 		args: { command: "echo hi" },
 	});
 	send({ type: "tool_execution_end", toolCallId: "call_1", toolName: "bash", result: { content: [{ type: "text", text: "hi" }], details: {} }, isError: false });
-	const delay = parseInt(process.env.FAKE_PI_DELAY ?? "150", 10);
-	setTimeout(() => finishRun(`Echo: ${lastPrompt}`), delay);
+	const delay = lastPrompt.includes("steer-slow") ? 600 : parseInt(process.env.FAKE_PI_DELAY ?? "150", 10);
+	setTimeout(() => emitUpdate("Echo:"), 40);
+	setTimeout(() => emitUpdate(`Echo: ${lastPrompt}`), 80);
+	setTimeout(() => finishRun(`Echo: ${lastPrompt}${steeredMessages.length ? " + " + steeredMessages.join(" + ") : ""}`), delay);
 }
 
 function finishRun(finalText) {
 	lastFinal = finalText;
-	send({
-		type: "message_update",
-		usage: { input: 1, output: 1, totalTokens: 2 },
-		assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: finalText },
-	});
+	emitUpdate(finalText, finalText);
 	send({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: finalText }], stopReason: "stop" } });
 	send({ type: "turn_end", message: { role: "assistant" }, toolResults: [] });
 	send({ type: "agent_end", messages: [], willRetry: false });
@@ -158,6 +167,10 @@ function handle(cmd) {
 		case "abort":
 			aborted = true;
 			respond(id, type, true, {});
+			break;
+		case "steer":
+			steeredMessages.push(typeof cmd.message === "string" ? cmd.message : JSON.stringify(cmd.message));
+			respond(id, type, true, { disposition: "queued" });
 			break;
 		case "abort_retry":
 			respond(id, type, true, {});

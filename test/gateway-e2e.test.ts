@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GatewayHost } from "../src/gateway";
 import type { PiCordConfig } from "../src/config";
-import type { ChatAdapter, DialogAnswer, DialogRequest, Incoming } from "../src/types";
+import type { ChatAdapter, DialogAnswer, DialogRequest, DispatchOpts, DispatchResult, Incoming, SlashCommandInfo } from "../src/types";
 
 const FAKE_PI = join(import.meta.dir, "fake-pi.mjs");
 
@@ -13,15 +13,17 @@ class MockAdapter {
 	botName = "mock-bot";
 	sent: Array<{ chatId: string; text: string }> = [];
 	edits: Array<{ chatId: string; messageId: string; text: string }> = [];
+	deleted: Array<{ chatId: string; messageId: string }> = [];
+	registeredCommands: SlashCommandInfo[][] = [];
 	asked: DialogRequest[] = [];
 	/** Scripted answers for ask(); each entry is called once in order. */
 	dialogScript: Array<(req: DialogRequest) => DialogAnswer> = [];
 	private nextId = 0;
-	private handler: ((msg: Incoming) => Promise<void>) | null = null;
+	private handler: ((msg: Incoming, opts?: DispatchOpts) => Promise<DispatchResult | undefined>) | null = null;
 
 	async start(): Promise<void> {}
 	async stop(): Promise<void> {}
-	onMessage(handler: (msg: Incoming) => Promise<void>): void {
+	onMessage(handler: (msg: Incoming, opts?: DispatchOpts) => Promise<DispatchResult | undefined>): void {
 		this.handler = handler;
 	}
 	async send(chatId: string, text: string): Promise<string> {
@@ -31,6 +33,13 @@ class MockAdapter {
 	async edit(chatId: string, messageId: string, text: string): Promise<boolean> {
 		this.edits.push({ chatId, messageId, text });
 		return true;
+	}
+	async delete(chatId: string, messageId: string): Promise<boolean> {
+		this.deleted.push({ chatId, messageId });
+		return true;
+	}
+	async registerCommands(commands: SlashCommandInfo[]): Promise<void> {
+		this.registeredCommands.push(commands);
 	}
 	startTyping(): () => void {
 		return () => {};
@@ -72,13 +81,22 @@ class MockAdapter {
 		return [...this.sentTo(chatId), ...this.edits.filter((e) => e.chatId === chatId).map((e) => e.text)];
 	}
 	async lastReply(): Promise<string> {
-		// wait for the run to deliver its final answer (poll the sent log)
+		// wait for the run to deliver its final answer (poll the sent log);
+		// streaming edits carry the "▌" cursor, so they are skipped
 		for (let i = 0; i < 200; i++) {
-			const final = this.delivered("chan-1").find((t) => t.startsWith("Echo:"));
+			const final = this.delivered("chan-1").find((t) => t.startsWith("Echo:") && !t.includes("▌"));
 			if (final) return final;
 			await new Promise((r) => setTimeout(r, 100));
 		}
 		throw new Error(`no Echo reply arrived; sent so far: ${JSON.stringify(this.delivered("chan-1"))}`);
+	}
+	/** Wait until an exact text appears among the delivered messages. */
+	async waitFinal(text: string): Promise<void> {
+		for (let i = 0; i < 200; i++) {
+			if (this.delivered("chan-1").includes(text)) return;
+			await new Promise((r) => setTimeout(r, 100));
+		}
+		throw new Error(`final text never arrived: ${text}; got: ${JSON.stringify(this.delivered("chan-1"))}`);
 	}
 }
 
@@ -273,10 +291,10 @@ describe("gateway end-to-end with fake pi", () => {
 			await host.addAdapter(adapter);
 			for (let i = 0; i < 2; i++) {
 				// wait for a NEW echo: delivered() accumulates across runs
-				const echoesBefore = adapter.delivered("chan-1").filter((t) => t.startsWith("Echo:")).length;
+				const echoesBefore = adapter.delivered("chan-1").filter((t) => t.startsWith("Echo:") && !t.includes("▌")).length;
 				await adapter.inject({ text: "notify me when done" });
 				for (let j = 0; j < 200; j++) {
-					const echoesNow = adapter.delivered("chan-1").filter((t) => t.startsWith("Echo:")).length;
+					const echoesNow = adapter.delivered("chan-1").filter((t) => t.startsWith("Echo:") && !t.includes("▌")).length;
 					if (echoesNow > echoesBefore) break;
 					await new Promise((r) => setTimeout(r, 100));
 				}
@@ -291,4 +309,75 @@ describe("gateway end-to-end with fake pi", () => {
 		await runTwice(off.host, off.adapter);
 		expect(off.adapter.sentTo("chan-1").some((t) => t.includes("Background job"))).toBe(false);
 	}, 30_000);
+
+	test("streams the answer into the status message as it arrives", async () => {
+		const dir = freshDir();
+		const { host, adapter } = makeHost(dir);
+		await host.addAdapter(adapter);
+		await adapter.inject({ text: "hello stream" });
+		const reply = await adapter.lastReply();
+		expect(reply).toBe("Echo: hello stream");
+		// at least one throttled streaming edit carried partial text with the cursor
+		const streamed = adapter.edits.filter((e) => e.text.includes("▌"));
+		expect(streamed.length).toBeGreaterThan(0);
+		expect(streamed[0]!.text).toContain("Echo:");
+		// the final delivery has no cursor
+		expect(reply.endsWith("▌")).toBe(false);
+		await host.stop();
+	}, 30_000);
+
+	test("mid-run messages steer the running agent instead of queueing", async () => {
+		const dir = freshDir();
+		const { host, adapter } = makeHost(dir);
+		await host.addAdapter(adapter);
+		await adapter.inject({ text: "steer-slow first" });
+		// let the run start, then send a follow-up while it is in flight
+		await new Promise((r) => setTimeout(r, 200));
+		await adapter.inject({ text: "second thought" });
+		await adapter.waitFinal("Echo: steer-slow first + second thought");
+		// steering is acknowledged, never queued
+		expect(adapter.sentTo("chan-1").some((t) => t.startsWith("↪️"))).toBe(true);
+		expect(adapter.sentTo("chan-1").some((t) => t.startsWith("📨"))).toBe(false);
+		await host.stop();
+	}, 30_000);
+
+	test("the visible window keeps only the last N turns", async () => {
+		const dir = freshDir();
+		const { host, adapter } = makeHost(dir, { uiHistoryTurns: 2 });
+		await host.addAdapter(adapter);
+		await adapter.inject({ text: "turn one", messageId: "u1" });
+		await adapter.waitFinal("Echo: turn one");
+		await adapter.inject({ text: "turn two", messageId: "u2" });
+		await adapter.waitFinal("Echo: turn two");
+		await adapter.inject({ text: "turn three", messageId: "u3" });
+		await adapter.waitFinal("Echo: turn three");
+		// turn 1 fell out of the window: its status message and user message got deleted
+		for (let i = 0; i < 100 && !adapter.deleted.some((d) => d.messageId === "1"); i++) {
+			await new Promise((r) => setTimeout(r, 100));
+		}
+		const deleted = adapter.deleted.map((d) => d.messageId);
+		expect(deleted).toContain("1"); // turn one's status message id
+		expect(deleted).toContain("u1");
+		expect(deleted).not.toContain("3"); // turn three's status message stays
+		// state keeps exactly the window
+		expect(host.state.getUiTurns("discord:chan-1")).toHaveLength(2);
+		await host.stop();
+	}, 40_000);
+
+	test("command menus merge gateway built-ins with child session commands", async () => {
+		const dir = freshDir();
+		const { host, adapter } = makeHost(dir);
+		await host.addAdapter(adapter);
+		await host.syncCommandMenus();
+		// first publish: built-ins only; second: merged with fake-pi's get_commands
+		expect(adapter.registeredCommands.length).toBe(2);
+		const merged = adapter.registeredCommands[1]!;
+		const names = merged.map((c) => c.name);
+		expect(names).toContain("new");
+		expect(names).toContain("echo-command");
+		const echo = merged.find((c) => c.name === "echo-command")!;
+		expect(echo.description).toBe("fake skill");
+		expect(echo.source).toBe("skill");
+		await host.stop();
+	}, 60_000);
 });

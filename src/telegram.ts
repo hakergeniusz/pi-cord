@@ -1,4 +1,4 @@
-import type { ChatAdapter, DialogAnswer, DialogRequest, ImageAttachment, Incoming } from "./types";
+import type { ChatAdapter, DialogAnswer, DialogRequest, DispatchOpts, DispatchResult, ImageAttachment, Incoming } from "./types";
 import { chunkText, mdToTelegramHtml, TELEGRAM_LIMIT } from "./format";
 import { createLogger } from "./util";
 
@@ -66,7 +66,7 @@ export class TelegramAdapter implements ChatAdapter {
 	readonly platform = "telegram" as const;
 	botName = "telegram-bot";
 	private readonly apiBase: string;
-	private handler: ((msg: Incoming) => Promise<void>) | null = null;
+	private handler: ((msg: Incoming, opts?: DispatchOpts) => Promise<DispatchResult | undefined>) | null = null;
 	private running = false;
 	private offset = 0;
 	private aborts = new Set<AbortController>();
@@ -89,7 +89,7 @@ export class TelegramAdapter implements ChatAdapter {
 		if (opts.initialOffset) this.offset = opts.initialOffset;
 	}
 
-	onMessage(handler: (msg: Incoming) => Promise<void>): void {
+	onMessage(handler: (msg: Incoming, opts?: DispatchOpts) => Promise<DispatchResult | undefined>): void {
 		this.handler = handler;
 	}
 
@@ -363,6 +363,7 @@ export class TelegramAdapter implements ChatAdapter {
 			command,
 			args,
 			isDM,
+			messageId: String(message.message_id),
 		};
 
 		if (!this.isAllowedUser(String(from.id))) {
@@ -481,6 +482,31 @@ export class TelegramAdapter implements ChatAdapter {
 				log("edit failed:", msgText);
 				return false;
 			}
+		}
+	}
+
+	/** Best-effort delete; works for the bot's own messages and (in private chats) the user's. */
+	async delete(chatId: string, messageId: string): Promise<boolean> {
+		try {
+			await this.api("deleteMessage", { chat_id: chatId, message_id: Number(messageId) });
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	/** Publish the native command menu (the client's "/" command list). */
+	async registerCommands(commands: import("./types").SlashCommandInfo[]): Promise<void> {
+		const seen = new Set<string>();
+		const menu = commands
+			.filter((c) => /^[a-z0-9_]{1,32}$/.test(c.name) && !seen.has(c.name) && seen.add(c.name))
+			.map((c) => ({ command: c.name, description: (c.description ?? "Pi command").slice(0, 256) }));
+		if (!menu.length) return;
+		try {
+			await this.api("setMyCommands", { commands: menu });
+			log(`command menu published (${menu.length} commands)`);
+		} catch (err) {
+			log("setMyCommands failed:", err instanceof Error ? err.message : err);
 		}
 	}
 

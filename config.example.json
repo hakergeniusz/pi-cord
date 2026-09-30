@@ -15,6 +15,10 @@
 		"suppress": []
 	},
 	"progressUpdates": true,
+	"streaming": true,
+	"slashCommands": true,
+	"uiHistoryTurns": 3,
+	"agentsMd": "~/.pi/agent/pi-cord/AGENTS.md",
 	"childIdleMinutes": 30,
 	"childArgs": [],
 	"discord": {

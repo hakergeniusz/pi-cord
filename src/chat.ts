@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, openSync, readSync, closeSync, statSync, readdirSync, type Stats } from "node:fs";
+import { existsSync, mkdirSync, openSync, readFileSync, readSync, closeSync, statSync, readdirSync, type Stats } from "node:fs";
 import { join } from "node:path";
 import type { DialogAnswer, DialogRequest, ImageAttachment } from "./types";
 import { RpcChild, type RpcEvent } from "./rpc";
@@ -15,6 +15,12 @@ export interface ChatTransport {
 	startTyping(chatId: string): () => void;
 }
 
+/** A finished chat exchange, handed to the gateway for UI-history pruning. */
+export interface CompletedTurn {
+	userMessageIds: string[];
+	messageIds: string[];
+}
+
 export interface ChatAgentOptions {
 	/** Platform-scoped chat key, e.g. "telegram:12345". */
 	key: string;
@@ -28,16 +34,21 @@ export interface ChatAgentOptions {
 	forwardDialog?: (req: DialogRequest) => Promise<DialogAnswer>;
 	/** Forward fire-and-forget extension notifications into the chat. */
 	forwardNotify?: (message: string, notifyType: string) => void;
+	/** Called when a run finishes, so the gateway can prune the visible chat history. */
+	onTurnComplete?: (turn: CompletedTurn) => void;
 }
 
 export interface SubmitResult {
 	queued: boolean;
 	position: number;
+	/** True when the message steered a running agent instead of queueing. */
+	steered?: boolean;
 }
 
 interface QueuedItem {
 	text: string;
 	images: ImageAttachment[];
+	userMessageId?: string;
 }
 
 interface ModelInfo {
@@ -52,13 +63,15 @@ const COMPACT_TIMEOUT = 15 * 60_000;
 const SETTLE_TIMEOUT = 45 * 60_000;
 const HANDLED_FALLBACK_MS = 15_000;
 const PROGRESS_EDIT_INTERVAL = 4_000;
+const STREAM_EDIT_INTERVAL = 1_500;
 const TYPING_INTERVAL = 8_000;
 
 /**
  * One chat = one headless pi session (`pi --mode rpc` child process) with its
  * own --session-dir, so per-chat history is pi's own session storage. Prompts
- * serialize per chat; tool activity streams into a single editable status
- * message; the final assistant text is delivered when the run settles.
+ * serialize per chat; mid-run messages steer the running agent (appended to
+ * its history at the next turn boundary, like pi's own steering); tool
+ * activity and the streaming answer share one editable message.
  */
 export class ChatAgent {
 	private child: RpcChild | null = null;
@@ -75,6 +88,14 @@ export class ChatAgent {
 	private retryError: string | null = null;
 	/** Set when the child died mid-run; runNext turns it into a chat error. */
 	private deathMessage: string | null = null;
+	/** Streaming state: cumulative text of the current assistant message. */
+	private streamText = "";
+	private streamActive = false;
+	private lastStreamEdit = 0;
+	private streamTimer: ReturnType<typeof setTimeout> | null = null;
+	/** Bot message ids posted during the current run (for UI-history pruning). */
+	private turnMessageIds: string[] = [];
+	private turnUserMessageIds: string[] = [];
 	readonly log: (...args: unknown[]) => void;
 
 	constructor(private readonly opts: ChatAgentOptions) {
@@ -106,6 +127,14 @@ export class ChatAgent {
 		if (saved && existsSync(saved)) args.push("--session", saved);
 		if (cfg.model) args.push("--model", cfg.model);
 		if (cfg.thinking) args.push("--thinking", cfg.thinking);
+		// Chat-only instructions (e.g. "no markdown tables"): a separate AGENTS.md
+		// the interactive pi never reads, appended to the child's system prompt.
+		const agentsMd = cfg.agentsMd ?? "~/.pi/agent/pi-cord/AGENTS.md";
+		try {
+			if (existsSync(expandTilde(agentsMd))) args.push("--append-system-prompt", readFileSync(expandTilde(agentsMd), "utf8"));
+		} catch (err) {
+			this.log("agentsMd read failed:", err);
+		}
 		// Extensions are on by default: chat sessions behave like the user's real
 		// pi (tools, guards, custom providers). Opt out with childExtensions:false.
 		if (cfg.childExtensions === false) args.push("--no-extensions");
@@ -162,6 +191,32 @@ export class ChatAgent {
 			case "agent_settled":
 				this.resolveSettled();
 				break;
+			case "message_start":
+				if (roleOf(e.message) === "assistant") {
+					this.streamText = "";
+					this.streamActive = true;
+				}
+				break;
+			case "message_update": {
+				if (roleOf(e.message) !== "assistant") break;
+				const snapshot = messageText(e.message);
+				const delta = typeof (e.assistantMessageEvent as { delta?: unknown } | undefined)?.delta === "string"
+					? (e.assistantMessageEvent as { delta: string }).delta
+					: "";
+				// Prefer the cumulative snapshot; fall back to delta accumulation.
+				this.streamText = snapshot || this.streamText + delta;
+				this.scheduleStreamEdit();
+				break;
+			}
+			case "message_end":
+				if (roleOf(e.message) === "assistant") {
+					const text = messageText(e.message);
+					if (text) this.streamText = text;
+					// Freeze: no more cursor edits; the final delivery edits the real
+					// answer over this message.
+					this.streamActive = false;
+				}
+				break;
 			case "tool_execution_start":
 				this.currentToolSummary = `${String(e.toolName ?? "tool")} ${summarize(e.args)}`.trim();
 				this.scheduleProgressEdit(true);
@@ -185,23 +240,54 @@ export class ChatAgent {
 
 	// ---- submission --------------------------------------------------------
 
-	async submit(text: string, images: ImageAttachment[] = []): Promise<SubmitResult> {
+	async submit(text: string, images: ImageAttachment[] = [], userMessageId?: string): Promise<SubmitResult> {
 		this.lastActivity = Date.now();
 		if (this.busy) {
-			this.queue.push({ text, images });
+			// Pi-style steering: append the message to the running conversation at
+			// the next turn boundary instead of queueing a separate run. The final
+			// answer of the ongoing run then covers it.
+			if (this.child?.running && (await this.steer(text, images))) {
+				if (userMessageId) this.turnUserMessageIds.push(userMessageId);
+				return { queued: false, position: 0, steered: true };
+			}
+			this.queue.push({ text, images, userMessageId });
 			return { queued: true, position: this.queue.length };
 		}
-		void this.runNext(text, images);
+		void this.runNext(text, images, userMessageId);
 		return { queued: false, position: 0 };
 	}
 
-	private async runNext(text: string, images: ImageAttachment[]): Promise<void> {
+	/** Try to steer a running agent; false when the child is gone or refuses. */
+	private async steer(text: string, images: ImageAttachment[]): Promise<boolean> {
+		try {
+			await this.child!.request(
+				{
+					type: "steer",
+					message: text,
+					...(images.length
+						? { images: images.map((i) => ({ type: "image", data: i.data.toString("base64"), mimeType: i.mimeType })) }
+						: {}),
+				},
+				RUN_REQUEST_TIMEOUT,
+			);
+			return true;
+		} catch (err) {
+			this.log("steer failed, falling back to queue:", err);
+			return false;
+		}
+	}
+
+	private async runNext(text: string, images: ImageAttachment[], userMessageId?: string): Promise<void> {
 		this.busy = true;
 		this.retryError = null;
 		this.deathMessage = null;
 		this.runStartedAt = Date.now();
 		this.currentToolSummary = "";
 		this.stopping = false;
+		this.turnUserMessageIds = userMessageId ? [userMessageId] : [];
+		this.turnMessageIds = [];
+		this.streamText = "";
+		this.streamActive = false;
 		this.typingStop = this.opts.transport.startTyping(this.opts.chatId);
 
 		try {
@@ -247,9 +333,23 @@ export class ChatAgent {
 			this.busy = false;
 			this.currentToolSummary = "";
 			this.statusMessageId = undefined;
+			this.streamText = "";
+			this.streamActive = false;
+			if (this.streamTimer) {
+				clearTimeout(this.streamTimer);
+				this.streamTimer = null;
+			}
+			const turn: CompletedTurn = { userMessageIds: this.turnUserMessageIds, messageIds: this.turnMessageIds };
+			this.turnUserMessageIds = [];
+			this.turnMessageIds = [];
+			try {
+				this.opts.onTurnComplete?.(turn);
+			} catch (err) {
+				this.log("onTurnComplete failed:", err);
+			}
 			void this.recordSessionFile();
 			const next = this.queue.shift();
-			if (next) void this.runNext(next.text, next.images);
+			if (next) void this.runNext(next.text, next.images, next.userMessageId);
 		}
 	}
 
@@ -295,7 +395,9 @@ export class ChatAgent {
 
 	private async sendStatus(text: string): Promise<string | undefined> {
 		try {
-			return await this.opts.transport.send(this.opts.chatId, text);
+			const id = await this.opts.transport.send(this.opts.chatId, text);
+			if (id) this.turnMessageIds.push(id);
+			return id;
 		} catch {
 			return undefined;
 		}
@@ -304,6 +406,9 @@ export class ChatAgent {
 	private scheduleProgressEdit(force: boolean): void {
 		if (!this.opts.config.progressUpdates) return;
 		if (!this.statusMessageId) return;
+		// Streaming text owns the message while it flows; tool progress only
+		// shows between assistant messages.
+		if (this.streamActive) return;
 		const now = Date.now();
 		if (!force && now - this.lastProgressEdit < PROGRESS_EDIT_INTERVAL) return;
 		this.lastProgressEdit = now;
@@ -315,9 +420,42 @@ export class ChatAgent {
 			.catch(() => {});
 	}
 
+	/** Throttled in-place edit of the status message with the streaming answer text. */
+	private scheduleStreamEdit(): void {
+		if (this.opts.config.streaming === false) return;
+		if (!this.statusMessageId || !this.streamActive) return;
+		const now = Date.now();
+		if (now - this.lastStreamEdit < STREAM_EDIT_INTERVAL) {
+			if (!this.streamTimer) {
+				this.streamTimer = setTimeout(() => {
+					this.streamTimer = null;
+					this.flushStreamEdit();
+				}, STREAM_EDIT_INTERVAL);
+				this.streamTimer.unref?.();
+			}
+			return;
+		}
+		this.flushStreamEdit();
+	}
+
+	private flushStreamEdit(): void {
+		if (!this.statusMessageId || !this.streamText) return;
+		if (this.opts.config.streaming === false) return;
+		if (!this.streamActive) return;
+		this.lastStreamEdit = Date.now();
+		const limit = (this.opts.key.startsWith("discord:") ? DISCORD_LIMIT : TELEGRAM_LIMIT) - 120;
+		// Once the message would overflow, keep the freshest tail visible; the
+		// final delivery re-chunks the whole answer properly.
+		const body = this.streamText.length > limit ? `…${this.streamText.slice(-limit)}` : this.streamText;
+		void this.opts.transport
+			.edit(this.opts.chatId, this.statusMessageId, `${body} ▌`)
+			.catch(() => {});
+	}
+
 	private async deliver(text: string): Promise<void> {
 		try {
-			await this.opts.transport.send(this.opts.chatId, text);
+			const id = await this.opts.transport.send(this.opts.chatId, text);
+			if (id) this.turnMessageIds.push(id);
 		} catch (err) {
 			this.log("deliver failed:", err);
 		}
@@ -523,13 +661,22 @@ export class ChatAgent {
 
 	/** Names of extension/skill/prompt commands the child accepts via prompt passthrough. */
 	async childCommandNames(): Promise<Set<string>> {
+		const commands = await this.childCommands();
+		return new Set(commands.map((c) => c.name));
+	}
+
+	/** Commands the child session accepts via prompt passthrough, with descriptions. */
+	async childCommands(): Promise<Array<{ name: string; description?: string; source: string }>> {
 		const child = this.child;
-		if (!child?.running) return new Set();
+		if (!child?.running) return [];
 		try {
-			const res = await child.request<{ commands: Array<{ name: string }> }>({ type: "get_commands" }, COMMAND_TIMEOUT);
-			return new Set(res.commands.map((c) => c.name));
+			const res = await child.request<{ commands: Array<{ name: string; description?: string; source: string }> }>(
+				{ type: "get_commands" },
+				COMMAND_TIMEOUT,
+			);
+			return res.commands ?? [];
 		} catch {
-			return new Set();
+			return [];
 		}
 	}
 
@@ -556,6 +703,71 @@ export class ChatAgent {
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((r) => setTimeout(r, ms));
+}
+
+function roleOf(message: unknown): string | undefined {
+	if (typeof message !== "object" || message === null) return undefined;
+	return (message as { role?: unknown }).role as string | undefined;
+}
+
+/** Concatenated text parts of an AgentMessage content field (string, parts array, or absent). */
+function messageText(message: unknown): string {
+	if (typeof message !== "object" || message === null) return "";
+	const content = (message as { content?: unknown }).content;
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.map((part) =>
+			typeof part === "object" && part !== null && (part as { type?: unknown }).type === "text"
+				? String((part as { text?: unknown }).text ?? "")
+				: "",
+		)
+		.join("");
+}
+
+/**
+ * Commands a fresh child session (default cwd, extensions enabled) accepts —
+ * used to build the native command menus without touching any chat's session.
+ */
+export async function fetchChildCommands(
+	config: PiCordConfig,
+): Promise<Array<{ name: string; description?: string; source: string }>> {
+	const cwd = resolveCwd(config);
+	mkdirSync(cwd, { recursive: true });
+	const child = RpcChild.spawn({
+		piPath: resolvePiPath(config),
+		args: [
+			"--mode",
+			"rpc",
+			...(config.childExtensions === false ? ["--no-extensions"] : []),
+			...(config.trustProject !== false ? ["--approve"] : []),
+			...(config.childArgs ?? []),
+		],
+		cwd,
+	});
+	try {
+		const deadline = Date.now() + 60_000;
+		for (;;) {
+			if (!child.running) throw new Error("probe exited during startup");
+			try {
+				await child.request({ type: "get_state" }, 10_000);
+				break;
+			} catch {
+				if (Date.now() > deadline) throw new Error("probe not ready in time");
+				await sleep(300);
+			}
+		}
+		const res = await child.request<{ commands?: Array<{ name: string; description?: string; source: string }> }>(
+			{ type: "get_commands" },
+			COMMAND_TIMEOUT,
+		);
+		return res.commands ?? [];
+	} catch (err) {
+		log("command probe failed:", err);
+		return [];
+	} finally {
+		void child.kill();
+	}
 }
 
 /** Best-effort label for a session file: a session_info name or the first user message snippet. */

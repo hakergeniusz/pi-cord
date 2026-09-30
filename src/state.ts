@@ -7,6 +7,16 @@ export interface ChatState {
 	cwd?: string;
 	/** Hashes of info-level notifications already delivered to this chat (dedupe). */
 	seenNotifies?: string[];
+	/** Bot messages shown for the most recent turns (newest last) for UI pruning. */
+	uiTurns?: UiTurn[];
+}
+
+/** One visible exchange: the user's message(s) plus the bot's messages. */
+export interface UiTurn {
+	/** Incoming message ids of this turn (empty when the platform entry isn't deletable). */
+	userMessageIds: string[];
+	/** Message ids the bot posted for this turn (status/final/chunks/acks). */
+	messageIds: string[];
 }
 
 export interface PiCordState {
@@ -68,6 +78,17 @@ export class StateStore {
 		if (seen.length > 100) seen.splice(0, seen.length - 100);
 		this.scheduleSave();
 		return false;
+	}
+
+	/** Replace the visible-turn window of a chat. */
+	setUiTurns(key: string, turns: UiTurn[]): void {
+		this.chat(key).uiTurns = turns;
+		this.scheduleSave();
+	}
+
+	/** Visible-turn window of a chat (empty when none recorded yet). */
+	getUiTurns(key: string): UiTurn[] {
+		return this.chat(key).uiTurns ?? [];
 	}
 
 	flush(): void {

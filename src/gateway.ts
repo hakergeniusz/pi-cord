@@ -1,11 +1,11 @@
 import { join, dirname } from "node:path";
 import { createHash } from "node:crypto";
-import type { ChatAdapter, DialogAnswer, DialogRequest, Incoming } from "./types";
-import { ChatAgent } from "./chat";
-import { handleMessage, isAllowed } from "./commands";
+import type { ChatAdapter, DialogAnswer, DialogRequest, Incoming, SlashCommandInfo } from "./types";
+import { fetchChildCommands, ChatAgent, type CompletedTurn } from "./chat";
+import { GATEWAY_COMMANDS, handleMessage, isAllowed, type CommandOutcome } from "./commands";
 import { hasAnyToken, loadConfig, resolvePiPath, type PiCordConfig } from "./config";
 import { acquireGatewayLock, readGatewayLock } from "./lock";
-import { StateStore } from "./state";
+import { StateStore, type UiTurn } from "./state";
 import { createLogger, expandTilde } from "./util";
 
 const log = createLogger("gateway");
@@ -31,7 +31,7 @@ export interface GatewayStatus {
 export class GatewayHost {
 	private adapters: ChatAdapter[] = [];
 	private chats = new Map<string, ChatAgent>();
-	private chains = new Map<string, Promise<void>>();
+	private chains = new Map<string, Promise<unknown>>();
 	private readonly pendingDialogs = new Map<string, PendingDialog>();
 	private reaper: ReturnType<typeof setInterval> | null = null;
 	private running = false;
@@ -112,6 +112,8 @@ export class GatewayHost {
 		}, REAP_INTERVAL_MS);
 		this.reaper.unref?.();
 
+		this.syncCommandMenus();
+
 		log(
 			`started (${this.adapters.map((a) => `${a.platform}:${a.botName}`).join(", ")}); pi: ${resolvePiPath(this.config)}`,
 		);
@@ -119,7 +121,7 @@ export class GatewayHost {
 
 	/** Register and start an adapter (config-driven ones use this too; also the test/future-platform hook). */
 	async addAdapter(adapter: ChatAdapter): Promise<void> {
-		adapter.onMessage((msg) => this.handleMessage(msg));
+		adapter.onMessage((msg, opts) => this.handleMessage(msg, opts));
 		await adapter.start();
 		this.adapters.push(adapter);
 		this.running = true;
@@ -145,7 +147,7 @@ export class GatewayHost {
 	}
 
 	/** Serialize handling per chat so message order is preserved. */
-	private enqueue(key: string, fn: () => Promise<void>): Promise<void> {
+	private enqueue<T>(key: string, fn: () => Promise<T>): Promise<T> {
 		const prev = this.chains.get(key) ?? Promise.resolve();
 		const next = prev.then(fn, fn);
 		this.chains.set(
@@ -155,9 +157,16 @@ export class GatewayHost {
 		return next;
 	}
 
-	async handleMessage(msg: Incoming): Promise<void> {
+	async handleMessage(
+		msg: Incoming,
+		opts?: { replySink?: (text: string) => Promise<string | undefined> },
+	): Promise<CommandOutcome | undefined> {
 		const key = `${msg.platform}:${msg.chatId}`;
-		await this.enqueue(key, async () => {
+		const deliver = async (text: string): Promise<string | undefined> => {
+			if (opts?.replySink) return opts.replySink(text);
+			return this.adapterFor(msg.platform).send(msg.chatId, text);
+		};
+		return this.enqueue(key, async (): Promise<CommandOutcome | undefined> => {
 			const chat = this.chatFor(key, msg.chatId);
 			try {
 				const outcome = await handleMessage(msg, {
@@ -167,25 +176,58 @@ export class GatewayHost {
 					cancelDialogs: () => this.cancelDialogsFor(key),
 				});
 				switch (outcome.kind) {
-					case "reply":
-						await this.adapterFor(msg.platform).send(msg.chatId, outcome.text);
+					case "reply": {
+						const id = await deliver(outcome.text);
+						void this.appendTurn(key, { userMessageIds: msg.messageId ? [msg.messageId] : [], messageIds: id ? [id] : [] });
 						break;
+					}
 					case "prompt": {
-						const res = await chat.submit(outcome.text, outcome.images);
+						const res = await chat.submit(outcome.text, outcome.images, msg.messageId);
 						if (res.queued) {
-							await this.adapterFor(msg.platform).send(msg.chatId, `📨 Queued (position ${res.position}) — I'll answer when the current run finishes.`);
+							const id = await deliver(`📨 Queued (position ${res.position}) — I'll answer when the current run finishes.`);
+							void this.appendTurn(key, { userMessageIds: [], messageIds: id ? [id] : [] });
+						} else if (res.steered) {
+							const id = await deliver("↪️ Appended to the running conversation — the agent picks it up this turn.");
+							void this.appendTurn(key, { userMessageIds: [], messageIds: id ? [id] : [] });
 						}
 						break;
 					}
 					case "ignored":
 						break;
 				}
+				return outcome;
 			} catch (err) {
 				log("handleMessage failed:", err);
 				const text = `⚠️ pi-cord error: ${err instanceof Error ? err.message : String(err)}`;
-				await this.adapterFor(msg.platform).send(msg.chatId, text).catch(() => {});
+				await deliver(text).catch(() => {});
+				return undefined;
 			}
 		});
+	}
+
+	// ---- visible-history window ---------------------------------------------
+
+	/**
+	 * Record a finished turn and delete messages that fell out of the visible
+	 * window (config.uiHistoryTurns, default 3). Best effort throughout.
+	 */
+	private async appendTurn(key: string, turn: UiTurn): Promise<void> {
+		const limit = this.config.uiHistoryTurns ?? 3;
+		if (limit <= 0) return; // pruning disabled
+		const empty = turn.userMessageIds.length === 0 && turn.messageIds.length === 0;
+		if (empty) return;
+		const turns = [...this.state.getUiTurns(key), turn];
+		const evicted = turns.length > limit ? turns.splice(0, turns.length - limit) : [];
+		this.state.setUiTurns(key, turns);
+		if (!evicted.length) return;
+		const adapter = this.adapterForChat(key);
+		if (!adapter?.delete) return;
+		const chatId = key.slice(key.indexOf(":") + 1);
+		for (const old of evicted) {
+			for (const id of [...old.messageIds, ...old.userMessageIds]) {
+				await adapter.delete(chatId, id).catch(() => {});
+			}
+		}
 	}
 
 	// ---- interactive dialog & notification forwarding -----------------------
@@ -284,6 +326,7 @@ export class GatewayHost {
 				sessionDir: join(this.sessionsBase, dirSafe),
 				forwardDialog: (req) => this.forwardDialog(key, chatId, req),
 				forwardNotify: (message, notifyType) => this.forwardNotify(key, chatId, message, notifyType),
+				onTurnComplete: (turn: CompletedTurn) => void this.appendTurn(key, turn),
 				transport: {
 					send: (cid, text) => this.adapterFor(key.startsWith("discord:") ? "discord" : "telegram").send(cid, text),
 					edit: (cid, msgId, text) =>
@@ -294,6 +337,41 @@ export class GatewayHost {
 			this.chats.set(key, chat);
 		}
 		return chat;
+	}
+
+	// ---- native command menus ------------------------------------------------
+
+	/**
+	 * Publish the platform command menus: gateway built-ins now, merged with the
+	 * child session's commands (extensions, skills, prompts) once a probe child
+	 * has answered. Runs in the background; failures are logged, never fatal.
+	 */
+	syncCommandMenus(): Promise<void> {
+		if (this.config.slashCommands === false) return Promise.resolve();
+		const publish = async () => {
+			await this.publishCommands(GATEWAY_COMMANDS);
+			const childCommands = await fetchChildCommands(this.config);
+			const merged = new Map<string, SlashCommandInfo>();
+			for (const cmd of GATEWAY_COMMANDS) merged.set(cmd.name, cmd);
+			for (const cmd of childCommands) {
+				if (!merged.has(cmd.name)) {
+					merged.set(cmd.name, {
+						name: cmd.name,
+						description: cmd.description || "Pi session command",
+						source: (cmd.source as SlashCommandInfo["source"]) ?? "extension",
+					});
+				}
+			}
+			await this.publishCommands([...merged.values()]);
+			log(`command menus published (${merged.size} commands)`);
+		};
+		return publish().catch((err) => log("command menu sync failed:", err));
+	}
+
+	private async publishCommands(commands: SlashCommandInfo[]): Promise<void> {
+		for (const adapter of this.adapters) {
+			await adapter.registerCommands?.(commands).catch((err) => log(`${adapter.platform} registerCommands failed:`, err));
+		}
 	}
 
 	/** One-line allowlist diagnostics for /pi-cord status in the TUI. */

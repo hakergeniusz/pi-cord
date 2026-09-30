@@ -49,6 +49,22 @@ export interface PiCordConfig {
 	notify?: NotifyConfig;
 	/** Live tool-activity edits on the status message. Default true. */
 	progressUpdates?: boolean;
+	/** Stream assistant text into the chat message as it is generated. Default true. */
+	streaming?: boolean;
+	/** Publish gateway + child commands as native Telegram/Discord slash commands. Default true. */
+	slashCommands?: boolean;
+	/**
+	 * How many recent turns stay visible in the chat; older bot (and where
+	 * possible user) messages are deleted as new turns complete. Default 3.
+	 * 0 keeps the full chat history.
+	 */
+	uiHistoryTurns?: number;
+	/**
+	 * AGENTS.md-style instructions appended to every child session's system
+	 * prompt — used only by pi-cord chats (the interactive pi never reads it).
+	 * Default ~/.pi/agent/pi-cord/AGENTS.md; missing file = no injection.
+	 */
+	agentsMd?: string;
 	/** Shut down an idle child after this many minutes. Default 30. */
 	childIdleMinutes?: number;
 	/** Extra CLI args for every child session. */

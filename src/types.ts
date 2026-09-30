@@ -47,6 +47,33 @@ export interface Incoming {
 	/** Everything after the command word. */
 	args?: string;
 	isDM: boolean;
+	/** Platform message id of the incoming text (used for UI history pruning). */
+	messageId?: string;
+}
+
+/** A command offered in the platform's native command menu (Telegram menu / Discord slash). */
+export interface SlashCommandInfo {
+	/** Command name without the leading slash (lowercase). */
+	name: string;
+	/** One-line human description. */
+	description?: string;
+	/** Where the command lives: gateway built-in or child session resource. */
+	source: "gateway" | "extension" | "prompt" | "skill";
+}
+
+/** Reply override for one dispatch: used by Discord interactions to answer in place. */
+export interface DispatchOpts {
+	/**
+	 * Deliver a command reply through this sink (e.g. an interaction editReply)
+	 * instead of a plain channel message. Returns the delivered message id when
+	 * the platform exposes one.
+	 */
+	replySink?: (text: string) => Promise<string | undefined>;
+}
+
+/** Minimal shape the adapters see back from a dispatch (for interaction acks). */
+export interface DispatchResult {
+	kind: "reply" | "prompt" | "ignored";
 }
 
 /** Delivery surface the gateway uses; implemented by Telegram, Discord and test adapters. */
@@ -59,6 +86,10 @@ export interface ChatAdapter {
 	/** Send text; returns the platform message id so it can be edited later. */
 	send(chatId: string, text: string): Promise<string | undefined>;
 	edit(chatId: string, messageId: string, text: string): Promise<boolean>;
+	/** Delete a message (UI history pruning). Best effort; false when not possible. */
+	delete?(chatId: string, messageId: string): Promise<boolean>;
+	/** Publish the native command menu (Telegram command list / Discord slash commands). */
+	registerCommands?(commands: SlashCommandInfo[]): Promise<void>;
 	/** Begin periodic typing indicators; returned fn stops them. */
 	startTyping(chatId: string): () => void;
 	/**
@@ -67,5 +98,5 @@ export interface ChatAdapter {
 	 * {cancelled: true} on timeout/teardown.
 	 */
 	ask(chatId: string, req: DialogRequest): Promise<DialogAnswer>;
-	onMessage(handler: (msg: Incoming) => Promise<void>): void;
+	onMessage(handler: (msg: Incoming, opts?: DispatchOpts) => Promise<DispatchResult | undefined>): void;
 }

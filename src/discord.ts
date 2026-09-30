@@ -1,4 +1,4 @@
-import type { ChatAdapter, DialogAnswer, DialogRequest, ImageAttachment, Incoming } from "./types";
+import type { ChatAdapter, DialogAnswer, DialogRequest, DispatchOpts, DispatchResult, ImageAttachment, Incoming, SlashCommandInfo } from "./types";
 import type { ActionRowBuilder, ButtonBuilder, StringSelectMenuBuilder } from "discord.js";
 import { DISCORD_LIMIT, chunkText } from "./format";
 import { createLogger } from "./util";
@@ -25,7 +25,7 @@ export class DiscordAdapter implements ChatAdapter {
 	readonly platform = "discord" as const;
 	botName = "discord-bot";
 	private client: import("discord.js").Client | null = null;
-	private handler: ((msg: Incoming) => Promise<void>) | null = null;
+	private handler: ((msg: Incoming, opts?: DispatchOpts) => Promise<DispatchResult | undefined>) | null = null;
 	private botUserId = "";
 	private readonly typingTimers = new Map<string, ReturnType<typeof setInterval>>();
 	private readonly pendingDialogs = new Map<string, PendingDialog>(); // localId -> pending
@@ -36,7 +36,7 @@ export class DiscordAdapter implements ChatAdapter {
 		private readonly opts: { allowedUsers: string[] },
 	) {}
 
-	onMessage(handler: (msg: Incoming) => Promise<void>): void {
+	onMessage(handler: (msg: Incoming, opts?: DispatchOpts) => Promise<DispatchResult | undefined>): void {
 		this.handler = handler;
 	}
 
@@ -155,6 +155,10 @@ export class DiscordAdapter implements ChatAdapter {
 	}
 
 	private async handleInteraction(interaction: import("discord.js").Interaction): Promise<void> {
+		if (interaction.isChatInputCommand()) {
+			await this.handleSlashCommand(interaction);
+			return;
+		}
 		if (!interaction.isMessageComponent()) return;
 		const customId = interaction.customId;
 		if (!customId.startsWith(DIALOG_PREFIX)) return;
@@ -196,6 +200,54 @@ export class DiscordAdapter implements ChatAdapter {
 			.update({ content: `${pending.originalText.slice(0, 1900)}\n\n${note}`.slice(0, 2000), components: [] })
 			.catch(() => {});
 		pending.resolve(answer);
+	}
+
+	/**
+	 * A native slash command: acknowledge the interaction, then run it through
+	 * the same pipeline as typed "/command" text. Replies are edited into the
+	 * interaction; prompts hand off to the normal streaming pipeline.
+	 */
+	private async handleSlashCommand(interaction: import("discord.js").ChatInputCommandInteraction): Promise<void> {
+		if (!this.isAllowedUser(interaction.user.id)) {
+			await interaction.reply({ content: "⛔ Not authorized.", ephemeral: true }).catch(() => {});
+			return;
+		}
+		await interaction.deferReply().catch(() => {});
+		const args = interaction.options.getString("args") ?? "";
+		const text = `/${interaction.commandName}${args ? ` ${args}` : ""}`;
+		const msg: Incoming = {
+			platform: "discord",
+			chatId: interaction.channelId,
+			userId: interaction.user.id,
+			userName: interaction.user.displayName ?? interaction.user.username,
+			text,
+			images: [],
+			isCommand: true,
+			command: interaction.commandName,
+			args,
+			isDM: !interaction.guild,
+		};
+		if (!this.handler) return;
+		let sinkUsed = false;
+		const sink = async (replyText: string): Promise<string | undefined> => {
+			sinkUsed = true;
+			const chunks = chunkText(replyText, DISCORD_LIMIT);
+			try {
+				const edited = await interaction.editReply({ content: chunks[0] ?? "" });
+				for (const chunk of chunks.slice(1)) await this.send(interaction.channelId, chunk);
+				return edited?.id;
+			} catch (err) {
+				log("interaction editReply failed:", err instanceof Error ? err.message : err);
+				await this.send(interaction.channelId, replyText).catch(() => {});
+				return undefined;
+			}
+		};
+		const outcome = await this.handler(msg, { replySink: sink });
+		if (sinkUsed) return;
+		// Prompts continue through the streaming pipeline; delete the deferred
+		// reply so nothing except the pipeline's own messages stays in the channel.
+		await interaction.deleteReply().catch(() => {});
+		void outcome;
 	}
 
 	/** Resolve pending input/editor dialogs when a user replies to the question message. Returns true when consumed. */
@@ -264,6 +316,7 @@ export class DiscordAdapter implements ChatAdapter {
 			command,
 			args,
 			isDM,
+			messageId: message.id,
 		};
 
 		if (!this.isAllowedUser(String(message.author.id))) {
@@ -308,6 +361,50 @@ export class DiscordAdapter implements ChatAdapter {
 		} catch (err) {
 			log("edit failed:", err instanceof Error ? err.message : err);
 			return false;
+		}
+	}
+
+	/** Best-effort delete; works for the bot's messages and guild user messages with Manage Messages. */
+	async delete(chatId: string, messageId: string): Promise<boolean> {
+		try {
+			const channel = await this.fetchChannel(chatId);
+			if (!channel || !("messages" in channel)) return false;
+			await channel.messages.delete(messageId);
+			return true;
+		} catch (err) {
+			log("delete failed:", err instanceof Error ? err.message : err);
+			return false;
+		}
+	}
+
+	/** Publish native slash commands: global (DMs) plus per-guild (instant availability). */
+	async registerCommands(commands: SlashCommandInfo[]): Promise<void> {
+		const client = this.client;
+		if (!client?.application) return;
+		const seen = new Set<string>();
+		const json = commands
+			.filter((c) => /^[a-z0-9_-]{1,32}$/.test(c.name) && !seen.has(c.name) && seen.add(c.name))
+			.map((c) => ({
+				name: c.name,
+				description: (c.description ?? "Pi command").slice(0, 100),
+				options: [
+					{
+						name: "args",
+						description: "Optional arguments",
+						type: 3 as const, // STRING
+						required: false,
+					},
+				],
+			}));
+		if (!json.length) return;
+		try {
+			await client.application.commands.set(json);
+			for (const [, guild] of client.guilds.cache) {
+				await guild.commands.set(json).catch((err) => log(`guild ${guild.id} command set failed:`, err));
+			}
+			log(`slash commands published (${json.length} commands)`);
+		} catch (err) {
+			log("registerCommands failed:", err instanceof Error ? err.message : err);
 		}
 	}
 

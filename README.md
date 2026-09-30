@@ -20,9 +20,12 @@ Discord / Telegram
 - **Interactive features, forwarded to chat**: when an extension (or `ask_question`) opens a dialog — confirm, select, input, editor — it appears in Telegram as **inline buttons** (or a ForceReply for free text) and in Discord as a **select menu / buttons** (or a reply-to prompt). Your tap becomes the dialog answer; unanswered dialogs time out (`dialogTimeoutSeconds`, default 180s) and cancel safely. `/stop` also cancels pending dialogs.
 - **Extension notifications** (`ctx.ui.notify`) are mirrored into the chat (ℹ️/⚠️/❌).
 - **Per-chat sessions and history**: every Discord channel / Telegram chat maps to its own pi session directory. `/sessions` and `/resume` browse previous conversations; history survives restarts.
-- **Commands**: `/new`, `/sessions`, `/resume`, `/stop`, `/status`, `/model`, `/thinking`, `/compact`, `/cwd`, `/ping`, `/id`, `/help`. Unknown `/commands` that exist as skills or prompt templates inside pi are forwarded to the agent.
-- **Live progress**: a status message shows elapsed time and current tool activity ("⚙️ bash: git status") and is edited in place into the final answer.
-- **Queued messages**: messages sent while the agent runs are queued, not lost.
+- **Commands**: `/new`, `/sessions`, `/resume`, `/stop`, `/status`, `/model`, `/thinking`, `/compact`, `/cwd`, `/commands`, `/ping`, `/id`, `/help`. Unknown `/commands` that exist as skills or prompt templates inside pi are forwarded to the agent.
+- **Native slash commands** (OpenClaw-style): the bot publishes every command — gateway built-ins *and* your extensions'/skills'/prompts' commands — as real Telegram command-menu entries and Discord slash commands. Pick them from the client UI; they run through the same pipeline.
+- **Live progress + streaming**: a status message shows elapsed time and current tool activity ("⚙️ bash: git status"), then the answer **streams into it token-by-token** as the model generates, and settles into the final text.
+- **Steering, not queueing**: messages sent while the agent runs are appended to the running conversation at the next turn boundary — exactly like typing a follow-up in pi — instead of being queued.
+- **Clean chat UI**: only the last `uiHistoryTurns` (default 3) exchanges stay visible; older messages are deleted as new turns complete. Full history still lives in pi's session files (`/sessions`).
+- **Chat-only instructions**: `~/.pi/agent/pi-cord/AGENTS.md` is appended to every chat session's system prompt — used to tell the model that markdown tables don't render in Telegram/Discord (use lists instead). Your interactive pi never reads it (override the path with `agentsMd`).
 - **Images**: attach photos/screenshots; they're passed to the model.
 - **Interruptible**: `/stop` aborts the current run and returns the partial answer.
 - **Runs as a systemd user service** — no interactive pi required and no tmux: the daemon spawns per-chat `pi --mode rpc` children on demand, restarts on failure, and picks up config changes live. (Also usable manually, or as a Pi extension inside your interactive pi.)
@@ -123,6 +126,7 @@ DM the bot (or @mention it in a server / reply to it in a group) and just type. 
 | `/thinking [level]` | show / set thinking level |
 | `/compact [instructions]` | compact the context |
 | `/cwd [path]` | show / set this chat's working directory (per chat, persisted) |
+| `/commands` | list every command incl. extensions, skills, prompts |
 | `/ping`, `/id`, `/help` | diagnostics |
 
 Typical flow from your phone:
@@ -154,6 +158,10 @@ you:  /stop          (anytime — also cancels open dialogs)
 | `notify.info` | `"once"` | info-notify policy: `"all"`, `"once"` (first of each distinct text per chat — stops repeat banners like extension startup notices), or `"off"`. warning/error always come through |
 | `notify.suppress` | `[]` | never forward a notification whose message contains one of these substrings, e.g. `["Multi-account loaded"]` |
 | `progressUpdates` | `true` | edit the status message with tool activity |
+| `streaming` | `true` | stream the answer into the status message as it is generated (throttled edits, ~1.5s) |
+| `slashCommands` | `true` | publish gateway + session commands as native Telegram/Discord slash commands |
+| `uiHistoryTurns` | `3` | keep only the last N turns visible in the chat (older messages are deleted); `0` keeps everything |
+| `agentsMd` | `~/.pi/agent/pi-cord/AGENTS.md` | file appended to chat sessions' system prompt (chat-only rules, e.g. "no markdown tables"); missing file = no injection |
 | `childIdleMinutes` | `30` | shut down an idle chat session after N minutes |
 | `childArgs` | `[]` | extra CLI args for every chat session |
 
@@ -183,7 +191,9 @@ Architecture: `src/gateway.ts` (adapters + chat map, per-chat serialization, dia
 
 ## Limitations / notes
 
-- One prompt runs at a time per chat (extra messages are queued); different chats run concurrently in separate processes.
+- One prompt runs at a time per chat; extra messages **steer the running agent** (appended to its history at the next turn boundary) — or queue as a fallback if steering fails. Different chats run concurrently in separate processes.
 - Telegram albums arrive as separate messages (each image prompts separately).
 - Discord answers go inline in the channel/DM (threads the bot creates are followed automatically).
+- Discord slash commands need the `bot` + `applications.commands` scopes; pi-cord registers them globally and per guild (guild registration is instant, global can take a little while to propagate).
+- Discord interaction replies and Telegram messages the bot may not delete (e.g. user messages in groups without admin rights) are skipped by the history pruning, best effort everywhere else.
 - The gateway is a control plane only — it never handles your prompts itself; the pi children do all agent work with your existing pi auth and model config.

@@ -1,5 +1,5 @@
 import type { ChatAgent } from "./chat";
-import type { Incoming } from "./types";
+import type { Incoming, SlashCommandInfo } from "./types";
 import type { PiCordConfig } from "./config";
 
 export const HELP_TEXT = [
@@ -15,12 +15,30 @@ export const HELP_TEXT = [
 	"/thinking [level] — show or set thinking level",
 	"/compact [instructions] — compact context",
 	"/cwd [path] — show or set this chat's working dir",
+	"/commands — list every command incl. extensions",
 	"/ping — check the agent is responsive",
 	"/id — show platform/chat/user ids",
 	"/help — this text",
 	"",
-	"Anything else is sent to the agent as a prompt. Unknown /commands that exist as skills or prompt templates are forwarded to the agent.",
+	"Anything else is sent to the agent as a prompt; messages sent while the agent runs steer it (pi-style) instead of queueing. Unknown /commands that exist as skills or prompt templates are forwarded to the agent.",
 ].join("\n");
+
+/** Gateway built-ins, in menu order (Telegram command list / Discord slash commands). */
+export const GATEWAY_COMMANDS: SlashCommandInfo[] = [
+	{ name: "new", description: "Start a fresh agent session", source: "gateway" },
+	{ name: "sessions", description: "List recent sessions for this chat", source: "gateway" },
+	{ name: "resume", description: "Switch to session n (see /sessions)", source: "gateway" },
+	{ name: "stop", description: "Abort the current run", source: "gateway" },
+	{ name: "status", description: "Model, session and context status", source: "gateway" },
+	{ name: "model", description: "Show or switch the model", source: "gateway" },
+	{ name: "thinking", description: "Show or set the thinking level", source: "gateway" },
+	{ name: "compact", description: "Compact the context", source: "gateway" },
+	{ name: "cwd", description: "Show or set this chat's working dir", source: "gateway" },
+	{ name: "commands", description: "List all commands incl. extensions", source: "gateway" },
+	{ name: "ping", description: "Check the agent is responsive", source: "gateway" },
+	{ name: "id", description: "Show platform/chat/user ids", source: "gateway" },
+	{ name: "help", description: "How to use this bot", source: "gateway" },
+];
 
 /** Commands that work even for non-allowlisted users (needed for bootstrapping). */
 const OPEN_COMMANDS = new Set(["id", "help", "start", "ping"]);
@@ -120,6 +138,18 @@ async function handleCommand(command: string, args: string, ctx: CommandContext,
 				return { kind: "reply", text: line ?? "(unknown)" };
 			}
 			return { kind: "reply", text: await chat.setChatCwd(args) };
+		case "commands": {
+			const child = await chat.childCommands();
+			const lines = [
+				"Gateway commands:",
+				...GATEWAY_COMMANDS.map((c) => `/${c.name}${c.description ? ` — ${c.description}` : ""}`),
+			];
+			if (child.length) {
+				lines.push("", "Session commands (extensions, skills, prompts):");
+				lines.push(...child.map((c) => `/${c.name}${c.description ? ` — ${c.description}` : ""}`));
+			}
+			return { kind: "reply", text: lines.join("\n") };
+		}
 		case "ping":
 			return { kind: "reply", text: await chat.ping() };
 		case "id":
