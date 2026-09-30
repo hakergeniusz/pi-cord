@@ -5,8 +5,11 @@
 	"model": null,
 	"thinking": null,
 	"cwd": "~/.pi/agent/pi-cord/workspace",
-	"childExtensions": false,
+	"childExtensions": true,
 	"trustProject": true,
+	"interactiveDialogs": true,
+	"dialogTimeoutSeconds": 180,
+	"forwardNotifications": true,
 	"progressUpdates": true,
 	"childIdleMinutes": 30,
 	"childArgs": [],
@@ -16,6 +19,6 @@
 	},
 	"telegram": {
 		"token": "PASTE_TELEGRAM_BOT_TOKEN",
-		"allowedUsers": []
+		"allowedUsers": [6679129297]
 	}
 }

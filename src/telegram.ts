@@ -1,4 +1,4 @@
-import type { ChatAdapter, ImageAttachment, Incoming } from "./types";
+import type { ChatAdapter, DialogAnswer, DialogRequest, ImageAttachment, Incoming } from "./types";
 import { chunkText, mdToTelegramHtml, TELEGRAM_LIMIT } from "./format";
 import { createLogger } from "./util";
 
@@ -36,12 +36,29 @@ interface TgMessage {
 	caption?: string;
 	photo?: TgPhotoSize[];
 	document?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
-	reply_to_message?: { from?: TgUser };
+	reply_to_message?: { from?: TgUser; message_id?: number };
 	entities?: Array<{ type: string; offset: number; length: number }>;
 }
 interface TgUpdate {
 	update_id: number;
 	message?: TgMessage;
+	callback_query?: {
+		id: string;
+		from: TgUser;
+		message?: TgMessage;
+		data?: string;
+	};
+}
+
+interface PendingDialog {
+	rpcId: string;
+	chatId: string;
+	kind: "select" | "confirm" | "input" | "editor";
+	options?: string[];
+	/** Message that asked the question; edited on resolution, matched for input replies. */
+	questionMessageId?: number;
+	resolve: (answer: DialogAnswer) => void;
+	originalText: string;
 }
 
 /** Telegram bot adapter: plain Bot API over fetch, no dependencies. */
@@ -55,6 +72,9 @@ export class TelegramAdapter implements ChatAdapter {
 	private aborts = new Set<AbortController>();
 	private readonly typingTimers = new Map<string, ReturnType<typeof setInterval>>();
 	private readonly lastUnauthorizedNotice = new Map<string, number>();
+	private readonly pendingDialogs = new Map<string, PendingDialog>(); // localId -> pending
+	private dialogSeq = 0;
+	private botUserId: number | undefined;
 
 	constructor(
 		private readonly token: string,
@@ -63,7 +83,6 @@ export class TelegramAdapter implements ChatAdapter {
 			/** Resume offset from persistent state so restarts don't replay old updates. */
 			initialOffset?: number;
 			onOffset?: (offset: number) => void;
-			/** Called for unauthorized DMs (after the built-in cooldown) if the gateway wants extra logging. */
 		},
 	) {
 		this.apiBase = `https://api.telegram.org/bot${token}`;
@@ -89,6 +108,8 @@ export class TelegramAdapter implements ChatAdapter {
 		this.aborts.clear();
 		for (const timer of this.typingTimers.values()) clearInterval(timer);
 		this.typingTimers.clear();
+		for (const pending of this.pendingDialogs.values()) pending.resolve({ cancelled: true });
+		this.pendingDialogs.clear();
 	}
 
 	private async api<T>(method: string, params?: Record<string, unknown>, timeoutMs = 30_000): Promise<T> {
@@ -128,7 +149,7 @@ export class TelegramAdapter implements ChatAdapter {
 			try {
 				updates = await this.api<TgUpdate[]>(
 					"getUpdates",
-					{ offset: this.offset, timeout: 25, allowed_updates: ["message"] },
+					{ offset: this.offset, timeout: 25, allowed_updates: ["message", "callback_query"] },
 					35_000,
 				);
 			} catch (err) {
@@ -140,14 +161,15 @@ export class TelegramAdapter implements ChatAdapter {
 				}
 				const retryAfter = (err as Error & { retryAfter?: number }).retryAfter;
 				log("getUpdates error:", err instanceof Error ? err.message : err);
-				await sleep((retryAfter ? retryAfter * 1000 : 3_000));
+				await sleep(retryAfter ? retryAfter * 1000 : 3_000);
 				continue;
 			}
 			for (const update of updates) {
 				this.offset = update.update_id + 1;
 				this.opts.onOffset?.(this.offset);
 				try {
-					await this.handleUpdate(update);
+					if (update.callback_query) await this.handleCallback(update.callback_query);
+					else if (update.message) await this.handleUpdate(update.message);
 				} catch (err) {
 					log("update handling failed:", err);
 				}
@@ -155,9 +177,152 @@ export class TelegramAdapter implements ChatAdapter {
 		}
 	}
 
-	private async handleUpdate(update: TgUpdate): Promise<void> {
-		const message = update.message;
-		if (!message) return;
+	// ---- interactive dialogs -------------------------------------------------
+
+	/** Present a dialog in the chat; resolves via inline-keyboard taps or replies to the question message. */
+	async ask(chatId: string, req: DialogRequest): Promise<DialogAnswer> {
+		const localId = `d${++this.dialogSeq}`;
+		return new Promise<DialogAnswer>((resolve) => {
+			const pending: PendingDialog = {
+				rpcId: req.id,
+				chatId,
+				kind: req.method,
+				options: req.options,
+				resolve,
+				originalText: "",
+			};
+			this.pendingDialogs.set(localId, pending);
+			void this.renderDialog(chatId, localId, req)
+				.then((messageId) => {
+					pending.questionMessageId = messageId;
+				})
+				.catch((err) => {
+					log("dialog render failed:", err);
+					if (this.pendingDialogs.delete(localId)) resolve({ cancelled: true });
+				});
+		});
+	}
+
+	private dialogBody(req: DialogRequest): string {
+		const lines = [req.title ?? "Agent needs your input"];
+		if (req.message) lines.push(req.message);
+		if (req.method === "input" || req.method === "editor") {
+			if (req.placeholder) lines.push(`(${req.placeholder})`);
+			if (req.prefill) lines.push(`(prefill: ${req.prefill.slice(0, 200)})`);
+			lines.push("↩️ Reply to this message with your answer.");
+		}
+		return lines.join("\n");
+	}
+
+	private async renderDialog(chatId: string, localId: string, req: DialogRequest): Promise<number | undefined> {
+		const pending = this.pendingDialogs.get(localId);
+		const body = this.dialogBody(req);
+		if (pending) pending.originalText = body;
+
+		if (req.method === "select" && req.options?.length) {
+			const keyboard = req.options.slice(0, 25).map((opt, i) => [
+				{ text: opt.slice(0, 60), callback_data: `pc|${localId}|o${i}` },
+			]);
+			const res = await this.api<{ message_id: number }>("sendMessage", {
+				chat_id: chatId,
+				text: body,
+				reply_markup: { inline_keyboard: keyboard },
+			});
+			return res.message_id;
+		}
+		if (req.method === "confirm") {
+			const keyboard = [
+				[
+					{ text: "✅ Yes", callback_data: `pc|${localId}|yes` },
+					{ text: "❌ No", callback_data: `pc|${localId}|no` },
+				],
+			];
+			const res = await this.api<{ message_id: number }>("sendMessage", {
+				chat_id: chatId,
+				text: body,
+				reply_markup: { inline_keyboard: keyboard },
+			});
+			return res.message_id;
+		}
+		// input / editor: ForceReply so the answer quotes the question
+		const res = await this.api<{ message_id: number }>("sendMessage", {
+			chat_id: chatId,
+			text: body,
+			reply_markup: { force_reply: true, input_field_placeholder: (req.placeholder ?? "your answer").slice(0, 64) },
+		});
+		return res.message_id;
+	}
+
+	private isAllowedUser(userId: string): boolean {
+		return this.opts.allowedUsers.map(String).includes(String(userId));
+	}
+
+	private async handleCallback(query: NonNullable<TgUpdate["callback_query"]>): Promise<void> {
+		const data = query.data ?? "";
+		const [tag, localId, payload] = data.split("|");
+		if (tag !== "pc" || !localId) {
+			await this.api("answerCallbackQuery", { callback_query_id: query.id }).catch(() => {});
+			return;
+		}
+		const pending = this.pendingDialogs.get(localId);
+		if (!pending || !query.message) {
+			await this.api("answerCallbackQuery", { callback_query_id: query.id, text: "This question is no longer active." }).catch(() => {});
+			return;
+		}
+		if (!this.isAllowedUser(String(query.from.id))) {
+			await this.api("answerCallbackQuery", { callback_query_id: query.id, text: "⛔ Not authorized" }).catch(() => {});
+			return;
+		}
+
+		let answer: DialogAnswer;
+		let note: string;
+		if (pending.kind === "select") {
+			const idx = Number.parseInt((payload ?? "").replace(/^o/, ""), 10);
+			const value = pending.options?.[idx];
+			if (value === undefined) {
+				await this.api("answerCallbackQuery", { callback_query_id: query.id, text: "Invalid option" }).catch(() => {});
+				return;
+			}
+			answer = { value };
+			note = `👉 ${value}`;
+		} else {
+			answer = { confirmed: payload === "yes" };
+			note = payload === "yes" ? "👉 Yes" : "👉 No";
+		}
+
+		this.pendingDialogs.delete(localId);
+		await this.api("answerCallbackQuery", { callback_query_id: query.id }).catch(() => {});
+		await this.api("editMessageText", {
+			chat_id: pending.chatId,
+			message_id: pending.questionMessageId,
+			text: `${pending.originalText}\n\n${note}`,
+		}).catch(() => {});
+		pending.resolve(answer);
+	}
+
+	/** Resolve a pending input/editor dialog when the user replies to the question message. Returns true when consumed. */
+	private tryResolveInputReply(message: TgMessage): boolean {
+		const repliedTo = message.reply_to_message?.message_id;
+		if (!repliedTo) return false;
+		for (const [localId, pending] of this.pendingDialogs) {
+			if ((pending.kind === "input" || pending.kind === "editor") && pending.questionMessageId === repliedTo && pending.chatId === String(message.chat.id)) {
+				this.pendingDialogs.delete(localId);
+				const text = (message.text ?? "").trim();
+				void this.api("editMessageText", {
+					chat_id: pending.chatId,
+					message_id: repliedTo,
+					text: `${pending.originalText}\n\n👉 ${text.slice(0, 200)}`,
+				}).catch(() => {});
+				pending.resolve(text ? { value: text } : { cancelled: true });
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// ---- inbound messages ------------------------------------------------
+
+	private async handleUpdate(message: TgMessage): Promise<void> {
 		const from = message.from;
 		if (!from || from.is_bot) return;
 
@@ -178,6 +343,10 @@ export class TelegramAdapter implements ChatAdapter {
 			}
 		}
 
+		// A reply that answers a pending dialog question is consumed here and
+		// never reaches the gateway as a new prompt.
+		if (this.tryResolveInputReply(message)) return;
+
 		// Group chats: only react to commands, mentions, replies to the bot.
 		if (!isDM && !command && !mentioned && !replyToBot) return;
 		if (!text && images.length === 0) return;
@@ -196,15 +365,13 @@ export class TelegramAdapter implements ChatAdapter {
 			isDM,
 		};
 
-		if (!this.opts.allowedUsers.map(String).includes(String(from.id))) {
+		if (!this.isAllowedUser(String(from.id))) {
 			if (isDM && text) this.maybeNoticeUnauthorized(message.chat.id, msg);
 			return;
 		}
 		if (!this.handler) return;
 		await this.handler(msg);
 	}
-
-	private botUserId: number | undefined;
 
 	private maybeNoticeUnauthorized(chatId: number, msg: Incoming): void {
 		const now = Date.now();
@@ -221,14 +388,13 @@ export class TelegramAdapter implements ChatAdapter {
 		const out: ImageAttachment[] = [];
 		try {
 			if (message.photo?.length) {
-				// photos come smallest-first; take the largest under the cap
+				// photos come smallest-first; the largest under the cap wins
 				const candidates = [...message.photo].reverse();
 				for (const p of candidates) {
-					if (out.length >= MAX_IMAGES) break;
 					if (p.file_size && p.file_size > MAX_IMAGE_BYTES) continue;
 					const att = await this.downloadFile(p.file_id);
 					if (att) out.push(att);
-					break; // one photo per message is enough; largest wins
+					break;
 				}
 			}
 			if (message.document && message.document.mime_type?.startsWith("image/") && out.length < MAX_IMAGES) {

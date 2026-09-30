@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GatewayHost } from "../src/gateway";
 import type { PiCordConfig } from "../src/config";
-import type { ChatAdapter, Incoming } from "../src/types";
+import type { ChatAdapter, DialogAnswer, DialogRequest, Incoming } from "../src/types";
 
 const FAKE_PI = join(import.meta.dir, "fake-pi.mjs");
 
@@ -13,6 +13,9 @@ class MockAdapter {
 	botName = "mock-bot";
 	sent: Array<{ chatId: string; text: string }> = [];
 	edits: Array<{ chatId: string; messageId: string; text: string }> = [];
+	asked: DialogRequest[] = [];
+	/** Scripted answers for ask(); each entry is called once in order. */
+	dialogScript: Array<(req: DialogRequest) => DialogAnswer> = [];
 	private nextId = 0;
 	private handler: ((msg: Incoming) => Promise<void>) | null = null;
 
@@ -31,6 +34,11 @@ class MockAdapter {
 	}
 	startTyping(): () => void {
 		return () => {};
+	}
+	async ask(chatId: string, req: DialogRequest): Promise<DialogAnswer> {
+		this.asked.push(req);
+		const scripted = this.dialogScript.shift();
+		return scripted ? scripted(req) : { cancelled: true };
 	}
 	async inject(msg: Partial<Incoming>): Promise<void> {
 		if (!this.handler) throw new Error("no handler wired");
@@ -176,6 +184,57 @@ describe("gateway end-to-end with fake pi", () => {
 		await adapter.inject({ text: "what is this", images: [{ data: png, mimeType: "image/png" }] });
 		const reply = await adapter.lastReply();
 		expect(reply).toContain("Echo: what is this");
+		await host.stop();
+	}, 30_000);
+
+	test("extension dialogs round-trip through the chat as scripted answers", async () => {
+		const dir = freshDir();
+		const { host, adapter } = makeHost(dir);
+		await host.addAdapter(adapter);
+		// fake-pi asks select -> confirm -> input for prompts containing "test dialogs"
+		adapter.dialogScript = [
+			(req) => {
+				expect(req.method).toBe("select");
+				expect(req.options).toEqual(["Allow", "Block"]);
+				return { value: "Block" };
+			},
+			(req) => {
+				expect(req.method).toBe("confirm");
+				return { confirmed: true };
+			},
+			(req) => {
+				expect(req.method).toBe("input");
+				return { value: "42" };
+			},
+		];
+		await adapter.inject({ text: "run test dialogs now" });
+		const reply = await adapter.lastReply();
+		expect(reply).toContain("[select=Block]");
+		expect(reply).toContain("[confirm=true]");
+		expect(reply).toContain("[input=42]");
+		expect(adapter.asked.map((r) => r.method)).toEqual(["select", "confirm", "input"]);
+		await host.stop();
+	}, 30_000);
+
+	test("dialogs without a scripted answer are cancelled so the run finishes", async () => {
+		const dir = freshDir();
+		const { host, adapter } = makeHost(dir);
+		await host.addAdapter(adapter);
+		await adapter.inject({ text: "run test dialogs now" });
+		const reply = await adapter.lastReply();
+		expect(reply).toContain("[select=cancelled]");
+		expect(reply).toContain("[confirm=cancelled]");
+		expect(reply).toContain("[input=cancelled]");
+		await host.stop();
+	}, 30_000);
+
+	test("extension notifications are mirrored into the chat", async () => {
+		const dir = freshDir();
+		const { host, adapter } = makeHost(dir);
+		await host.addAdapter(adapter);
+		await adapter.inject({ text: "notify me when done" });
+		await adapter.lastReply();
+		expect(adapter.sentTo("chan-1")).toContain("ℹ️ Background job finished");
 		await host.stop();
 	}, 30_000);
 });

@@ -16,6 +16,9 @@ Discord / Telegram
 ## What you get
 
 - **Chat with your agent** from your phone: prompts run as full agent sessions with tools in a working directory you control.
+- **All your extensions load in chat sessions.** Chat sessions are real pi sessions: your extensions, skills, prompt templates, custom providers, guards — everything from `~/.pi/agent` works (opt out with `"childExtensions": false`).
+- **Interactive features, forwarded to chat**: when an extension (or `ask_question`) opens a dialog — confirm, select, input, editor — it appears in Telegram as **inline buttons** (or a ForceReply for free text) and in Discord as a **select menu / buttons** (or a reply-to prompt). Your tap becomes the dialog answer; unanswered dialogs time out (`dialogTimeoutSeconds`, default 180s) and cancel safely. `/stop` also cancels pending dialogs.
+- **Extension notifications** (`ctx.ui.notify`) are mirrored into the chat (ℹ️/⚠️/❌).
 - **Per-chat sessions and history**: every Discord channel / Telegram chat maps to its own pi session directory. `/sessions` and `/resume` browse previous conversations; history survives restarts.
 - **Commands**: `/new`, `/sessions`, `/resume`, `/stop`, `/status`, `/model`, `/thinking`, `/compact`, `/cwd`, `/ping`, `/id`, `/help`. Unknown `/commands` that exist as skills or prompt templates inside pi are forwarded to the agent.
 - **Live progress**: a status message shows elapsed time and current tool activity ("⚙️ bash: git status") and is edited in place into the final answer.
@@ -29,9 +32,9 @@ Discord / Telegram
 The bot can run shell commands on your machine. pi-cord is **fail-closed**:
 
 - Each platform has an `allowedUsers` list of platform user ids. **Empty list = everyone is denied.**
-- Unauthorized users get no agent access; in DMs they get a notice with their id (so you can allowlist them), in groups they're ignored.
+- Unauthorized users get no agent access; in DMs they get a notice with their id (so you can allowlist them), in groups they're ignored. Buttons and interactive replies are also allowlist-checked.
 - Group chats only trigger on commands, @mentions, and replies to the bot.
-- Chat sessions run with `--no-extensions` by default (predictable, nothing blocks on TUI dialogs); set `"childExtensions": true` to load your extension set.
+- Chat sessions load your extensions by default — they run with your real pi config. Set `"childExtensions": false` for a bare-agent session.
 - The token lives in a config file you create — keep it `chmod 600`, it's in `.gitignore` if you keep the config in the repo dir.
 
 **Everyone in `allowedUsers` has full shell access to the machine (scoped to the chat's cwd).** Only allowlist yourself (and people you'd give a terminal to).
@@ -121,8 +124,10 @@ Typical flow from your phone:
 you:  check why tests fail in ~/projects/api and fix them
 bot:  🧠 Working… 12s
       ⚙️ bash: npm test -- --run
+bot:  ─ Allow dangerous command?        (extension dialog)
+      [✅ Yes] [❌ No]                   (tap to answer)
 bot:  Two tests failed because … <fixed, all green now>
-you:  /stop          (anytime)
+you:  /stop          (anytime — also cancels open dialogs)
 ```
 
 ## Configuration reference
@@ -134,8 +139,11 @@ you:  /stop          (anytime)
 | `cwd` | `~/.pi/agent/pi-cord/workspace` | default working dir for chats (per-chat override via `/cwd`) |
 | `model` | pi default | model pattern for chat sessions |
 | `thinking` | pi default | thinking level for chat sessions |
-| `childExtensions` | `false` | load your extensions in chat sessions |
+| `childExtensions` | `true` | load your extensions, skills, and templates in chat sessions |
 | `trustProject` | `true` | pass `--approve` to chat sessions (trust project skills/prompts) |
+| `interactiveDialogs` | `true` | forward extension dialogs into the chat as buttons/replies |
+| `dialogTimeoutSeconds` | `180` | cancel a chat dialog after this long (never longer than the extension's own timeout) |
+| `forwardNotifications` | `true` | mirror `ctx.ui.notify` messages from extensions into the chat |
 | `progressUpdates` | `true` | edit the status message with tool activity |
 | `childIdleMinutes` | `30` | shut down an idle chat session after N minutes |
 | `childArgs` | `[]` | extra CLI args for every chat session |
@@ -152,7 +160,7 @@ bun test            # unit tests + gateway E2E against test/fake-pi.mjs (a fake 
 
 `test/fake-pi.mjs` implements enough of pi's RPC protocol (JSONL, LF framing, id-correlated responses, `agent_settled` event flow) to test the whole gateway without a model or network.
 
-Architecture: `src/gateway.ts` (adapters + chat map, per-chat serialization) · `src/chat.ts` (ChatAgent: pi child lifecycle, queue, progress, delivery) · `src/rpc.ts` (RPC client: LF framing, id correlation, auto-cancelled dialogs) · `src/telegram.ts` (zero-dep Bot API) · `src/discord.ts` (discord.js) · `src/commands.ts` (auth + command table) · `src/index.ts` (pi extension entry) · `src/main.ts` (standalone entry).
+Architecture: `src/gateway.ts` (adapters + chat map, per-chat serialization, dialog/notify routing) · `src/chat.ts` (ChatAgent: pi child lifecycle, queue, progress, delivery) · `src/rpc.ts` (RPC client: LF framing, id correlation, extension-UI dialog sub-protocol) · `src/telegram.ts` (zero-dep Bot API: long polling, inline keyboards, callback queries, ForceReply) · `src/discord.ts` (discord.js: select menus, buttons, interactions, reply-to) · `src/commands.ts` (auth + command table) · `src/index.ts` (pi extension entry) · `src/main.ts` (standalone entry).
 
 ## Troubleshooting
 

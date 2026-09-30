@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, openSync, readSync, closeSync, statSync, readdirSync, type Stats } from "node:fs";
 import { join } from "node:path";
-import type { ImageAttachment } from "./types";
+import type { DialogAnswer, DialogRequest, ImageAttachment } from "./types";
 import { RpcChild, type RpcEvent } from "./rpc";
 import { expandTilde, formatDuration, formatTokens, fuzzyModelScore, summarize, createLogger } from "./util";
 import { resolveCwd, resolvePiPath, type PiCordConfig } from "./config";
@@ -24,6 +24,10 @@ export interface ChatAgentOptions {
 	/** Session directory for this chat (created lazily). */
 	sessionDir: string;
 	transport: ChatTransport;
+	/** Forward extension dialogs to the chat user (buttons / reply prompts). */
+	forwardDialog?: (req: DialogRequest) => Promise<DialogAnswer>;
+	/** Forward fire-and-forget extension notifications into the chat. */
+	forwardNotify?: (message: string, notifyType: string) => void;
 }
 
 export interface SubmitResult {
@@ -102,7 +106,9 @@ export class ChatAgent {
 		if (saved && existsSync(saved)) args.push("--session", saved);
 		if (cfg.model) args.push("--model", cfg.model);
 		if (cfg.thinking) args.push("--thinking", cfg.thinking);
-		if (!cfg.childExtensions) args.push("--no-extensions");
+		// Extensions are on by default: chat sessions behave like the user's real
+		// pi (tools, guards, custom providers). Opt out with childExtensions:false.
+		if (cfg.childExtensions === false) args.push("--no-extensions");
 		if (cfg.trustProject !== false) args.push("--approve");
 		args.push(...(cfg.childArgs ?? []));
 		return args;
@@ -120,6 +126,8 @@ export class ChatAgent {
 			args: this.childArgs(),
 			cwd,
 			onEvent: (e) => this.onEvent(e),
+			onDialog: (req) => (this.opts.forwardDialog ? this.opts.forwardDialog(req) : Promise.resolve({ cancelled: true })),
+			onNotify: (message, notifyType) => this.opts.forwardNotify?.(message, notifyType),
 			onExit: () => {
 				if (this.child === child) this.child = null;
 				if (this.busy) {
@@ -334,8 +342,9 @@ export class ChatAgent {
 
 	// ---- commands ----------------------------------------------------------
 
-	/** Abort the current run (if any). Returns false when nothing is running. */
+	/** Abort the current run (if any) and cancel any pending interactive dialogs. Returns false when nothing is running. */
 	async stop(): Promise<boolean> {
+		this.child?.cancelDialogs();
 		if (!this.child?.running || !this.busy) return false;
 		this.stopping = true;
 		try {
@@ -528,6 +537,7 @@ export class ChatAgent {
 		this.typingStop?.();
 		this.queue = [];
 		this.resolveSettled();
+		this.child?.cancelDialogs();
 		if (this.child) {
 			await this.child.kill();
 			this.child = null;

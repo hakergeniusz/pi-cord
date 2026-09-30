@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import type { DialogAnswer, DialogRequest } from "./types";
 import { RingBuffer, createLogger } from "./util";
 
 /**
@@ -32,6 +33,14 @@ export interface SpawnOptions {
 	onExit?: (code: number | null, signal: string | null) => void;
 	/** Per-event hook (agent events, tool executions, ...). */
 	onEvent?: (event: RpcEvent) => void;
+	/**
+	 * Forward a blocking extension dialog (ctx.ui.select/confirm/input/editor).
+	 * The resolved answer is written back as extension_ui_response. Implementations
+	 * must resolve; on rejection the dialog is answered as cancelled.
+	 */
+	onDialog?: (req: DialogRequest) => Promise<DialogAnswer>;
+	/** Fire-and-forget extension notifications (ctx.ui.notify). */
+	onNotify?: (message: string, notifyType: string) => void;
 }
 
 export class RpcChild {
@@ -48,9 +57,13 @@ export class RpcChild {
 		readonly pid: number,
 		private readonly procRef: ChildProcess,
 		private readonly onExitCb: ((code: number | null, signal: string | null) => void) | undefined,
+		private readonly onDialogCb: ((req: DialogRequest) => Promise<DialogAnswer>) | undefined,
+		private readonly onNotifyCb: ((message: string, notifyType: string) => void) | undefined,
 	) {}
 
 	private readonly listeners = new Set<(event: RpcEvent) => void>();
+	/** Locally generated ids for pending dialogs we forwarded to the chat. */
+	private dialogIds = new Set<string>();
 
 	/** Subscribe to session events; returns an unsubscribe function. */
 	onEvent(fn: (event: RpcEvent) => void): () => void {
@@ -65,7 +78,7 @@ export class RpcChild {
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 
-		const rpc = new RpcChild(child.pid ?? -1, child, opts.onExit);
+		const rpc = new RpcChild(child.pid ?? -1, child, opts.onExit, opts.onDialog, opts.onNotify);
 		if (opts.onEvent) rpc.onEvent(opts.onEvent);
 		child.stdout?.on("data", (chunk: Buffer) => rpc.handleStdout(chunk));
 		child.stderr?.on("data", (chunk: Buffer) => {
@@ -79,6 +92,7 @@ export class RpcChild {
 		child.on("exit", (code, signal) => {
 			log(`pi child (pid ${child.pid}) exited code=${code} signal=${signal}`);
 			rpc.failAll(new Error(`pi process exited unexpectedly (code ${code}, signal ${signal}). stderr:\n${rpc.stderrTail.tail(6)}`));
+			rpc.resolveAllDialogs({ cancelled: true });
 			rpc.finishExit(code, signal);
 			opts.onExit?.(code, signal);
 		});
@@ -138,7 +152,7 @@ export class RpcChild {
 			return;
 		}
 		if (record.type === "extension_ui_request") {
-			this.autoAnswerUi(record);
+			this.handleUiRequest(record);
 			return;
 		}
 		for (const listener of this.listeners) {
@@ -150,13 +164,52 @@ export class RpcChild {
 		}
 	}
 
-	/** Cancel dialog requests so nothing blocks; notify/setStatus are ignored. */
-	private autoAnswerUi(record: RpcEvent): void {
+	/** Route extension UI records: dialogs get forwarded, notify is fire-and-forget, rest ignored. */
+	private handleUiRequest(record: RpcEvent): void {
 		const method = String(record.method ?? "");
-		const needsAnswer = method === "select" || method === "confirm" || method === "input" || method === "editor";
-		if (!needsAnswer) return;
-		this.writeRaw({ type: "extension_ui_response", id: record.id, cancelled: true });
-		log(`auto-cancelled extension dialog (${method}) in child`);
+		if (method === "notify") {
+			this.onNotifyCb?.(String(record.message ?? ""), String(record.notifyType ?? "info"));
+			return;
+		}
+		const isDialog = method === "select" || method === "confirm" || method === "input" || method === "editor";
+		if (!isDialog) return; // setStatus/setWidget/setTitle/set_editor_text are TUI-only concerns
+		if (!this.onDialogCb) {
+			this.writeRaw({ type: "extension_ui_response", id: record.id, cancelled: true });
+			return;
+		}
+		const req: DialogRequest = {
+			id: String(record.id ?? ""),
+			method,
+			title: typeof record.title === "string" ? record.title : undefined,
+			message: typeof record.message === "string" ? record.message : undefined,
+			options: Array.isArray(record.options) ? record.options.map(String) : undefined,
+			placeholder: typeof record.placeholder === "string" ? record.placeholder : undefined,
+			prefill: typeof record.prefill === "string" ? record.prefill : undefined,
+			timeoutMs: typeof record.timeout === "number" ? record.timeout : undefined,
+		};
+		this.dialogIds.add(req.id);
+		this.onDialogCb(req)
+			.then((answer) => {
+				if (!this.dialogIds.delete(req.id)) return; // already resolved via resolveAllDialogs
+				this.writeRaw({ type: "extension_ui_response", id: req.id, ...answer });
+			})
+			.catch((err) => {
+				this.dialogIds.delete(req.id);
+				log("dialog forwarder failed:", String(err));
+				this.writeRaw({ type: "extension_ui_response", id: req.id, cancelled: true });
+			});
+	}
+
+	/** Force-outstanding dialogs (used on stop/shutdown): resolves forwarders but keeps pi waiting for our reply. */
+	cancelDialogs(): void {
+		const ids = [...this.dialogIds];
+		this.dialogIds.clear();
+		for (const id of ids) this.writeRaw({ type: "extension_ui_response", id, cancelled: true });
+	}
+
+	private resolveAllDialogs(answer: DialogAnswer): void {
+		this.dialogIds.clear(); // forwarder results are dropped; process is gone anyway
+		void answer;
 	}
 
 	private writeRaw(obj: unknown): void {

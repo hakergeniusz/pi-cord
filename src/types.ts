@@ -6,6 +6,31 @@ export interface ImageAttachment {
 	mimeType: string;
 }
 
+/** A pi extension dialog (ctx.ui.select/confirm/input/editor) forwarded from a chat session. */
+export interface DialogRequest {
+	/** Unique request id from the RPC extension-UI protocol. */
+	id: string;
+	method: "select" | "confirm" | "input" | "editor";
+	title?: string;
+	message?: string;
+	/** select only. */
+	options?: string[];
+	placeholder?: string;
+	/** editor only. */
+	prefill?: string;
+	/** Agent-side timeout in ms, if the extension declared one. */
+	timeoutMs?: number;
+}
+
+/** What the chat user answered. Exactly one style applies per method. */
+export interface DialogAnswer {
+	/** select / input / editor */
+	value?: string;
+	/** confirm */
+	confirmed?: boolean;
+	cancelled?: boolean;
+}
+
 /** Normalized message from either platform. */
 export interface Incoming {
 	platform: Platform;
@@ -36,5 +61,11 @@ export interface ChatAdapter {
 	edit(chatId: string, messageId: string, text: string): Promise<boolean>;
 	/** Begin periodic typing indicators; returned fn stops them. */
 	startTyping(chatId: string): () => void;
+	/**
+	 * Present an interactive dialog in the chat and wait for the user's answer.
+	 * Implementations must resolve (never hang): with the user's answer, or
+	 * {cancelled: true} on timeout/teardown.
+	 */
+	ask(chatId: string, req: DialogRequest): Promise<DialogAnswer>;
 	onMessage(handler: (msg: Incoming) => Promise<void>): void;
 }

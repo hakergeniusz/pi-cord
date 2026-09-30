@@ -23,10 +23,16 @@ export interface PiCordConfig {
 	model?: string;
 	/** Default thinking level: off|minimal|low|medium|high|xhigh|max. */
 	thinking?: string;
-	/** Load the user's extensions in child sessions. Default false (predictable, non-blocking). */
+	/** Load the user's extensions in child sessions. Default true — chat sessions behave like your real pi. */
 	childExtensions?: boolean;
 	/** Trust project-local resources (skills, prompts) in child sessions. Default true. */
 	trustProject?: boolean;
+	/** Forward extension dialogs (confirm/select/input) into the chat as buttons/replies. Default true. */
+	interactiveDialogs?: boolean;
+	/** Seconds to wait for a chat answer before a dialog is cancelled. Default 180. */
+	dialogTimeoutSeconds?: number;
+	/** Mirror fire-and-forget extension notifications (ctx.ui.notify) into the chat. Default true. */
+	forwardNotifications?: boolean;
 	/** Live tool-activity edits on the status message. Default true. */
 	progressUpdates?: boolean;
 	/** Shut down an idle child after this many minutes. Default 30. */

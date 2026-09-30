@@ -1,5 +1,5 @@
 import { join, dirname } from "node:path";
-import type { ChatAdapter, Incoming } from "./types";
+import type { ChatAdapter, DialogAnswer, DialogRequest, Incoming } from "./types";
 import { ChatAgent } from "./chat";
 import { handleMessage, isAllowed } from "./commands";
 import { hasAnyToken, loadConfig, resolvePiPath, type PiCordConfig } from "./config";
@@ -9,6 +9,12 @@ import { createLogger, expandTilde } from "./util";
 const log = createLogger("gateway");
 
 const REAP_INTERVAL_MS = 60_000;
+const NOTIFY_ICON: Record<string, string> = { info: "ℹ️", warning: "⚠️", error: "❌" };
+
+interface PendingDialog {
+	key: string;
+	cancel: (answer: DialogAnswer) => void;
+}
 
 export interface GatewayStatus {
 	running: boolean;
@@ -24,6 +30,7 @@ export class GatewayHost {
 	private adapters: ChatAdapter[] = [];
 	private chats = new Map<string, ChatAgent>();
 	private chains = new Map<string, Promise<void>>();
+	private readonly pendingDialogs = new Map<string, PendingDialog>();
 	private reaper: ReturnType<typeof setInterval> | null = null;
 	private running = false;
 	readonly state: StateStore;
@@ -141,7 +148,12 @@ export class GatewayHost {
 		await this.enqueue(key, async () => {
 			const chat = this.chatFor(key, msg.chatId);
 			try {
-				const outcome = await handleMessage(msg, { config: this.config, chat });
+				const outcome = await handleMessage(msg, {
+					config: this.config,
+					chat,
+					chatKey: key,
+					cancelDialogs: () => this.cancelDialogsFor(key),
+				});
 				switch (outcome.kind) {
 					case "reply":
 						await this.adapterFor(msg.platform).send(msg.chatId, outcome.text);
@@ -164,6 +176,65 @@ export class GatewayHost {
 		});
 	}
 
+	// ---- interactive dialog & notification forwarding -----------------------
+
+	/** Present a child's extension dialog in the chat; resolves with the answer or cancellation on timeout. */
+	private async forwardDialog(key: string, chatId: string, req: DialogRequest): Promise<DialogAnswer> {
+		const cfg = this.config;
+		if (cfg.interactiveDialogs === false) return { cancelled: true };
+		const adapter = this.adapterFor(key.startsWith("discord:") ? "discord" : "telegram");
+		const timeoutMs = (cfg.dialogTimeoutSeconds ?? 180) * 1000;
+		const effective = req.timeoutMs ? Math.min(req.timeoutMs, timeoutMs) : timeoutMs;
+
+		return new Promise<DialogAnswer>((resolve) => {
+			const timer = setTimeout(() => {
+				this.pendingDialogs.delete(req.id);
+				resolve({ cancelled: true });
+			}, effective + 1000); // outlive the agent-side timeout if one was declared
+			timer.unref?.();
+			this.pendingDialogs.set(req.id, {
+				key,
+				cancel: (answer) => {
+					clearTimeout(timer);
+					this.pendingDialogs.delete(req.id);
+					resolve(answer);
+				},
+			});
+			adapter
+				.ask(chatId, req)
+				.then((answer) => {
+					const pending = this.pendingDialogs.get(req.id);
+					if (pending) {
+						clearTimeout(timer);
+						this.pendingDialogs.delete(req.id);
+						resolve(answer);
+					}
+				})
+				.catch((err) => {
+					log("adapter ask failed:", err);
+					const pending = this.pendingDialogs.get(req.id);
+					if (pending) pending.cancel({ cancelled: true });
+				});
+		});
+	}
+
+	/** Cancel every pending dialog of a chat (used by /stop). */
+	cancelDialogsFor(key: string): void {
+		for (const [id, pending] of this.pendingDialogs) {
+			if (pending.key === key) pending.cancel({ cancelled: true });
+			void id;
+		}
+	}
+
+	private forwardNotify(key: string, chatId: string, message: string, notifyType: string): void {
+		if (this.config.forwardNotifications === false) return;
+		const icon = NOTIFY_ICON[notifyType] ?? "ℹ️";
+		const text = `${icon} ${message}`;
+		this.adapterFor(key.startsWith("discord:") ? "discord" : "telegram")
+			.send(chatId, text.length > 500 ? `${text.slice(0, 499)}…` : text)
+			.catch(() => {});
+	}
+
 	adapterFor(platform: Incoming["platform"]): ChatAdapter {
 		const adapter = this.adapters.find((a) => a.platform === platform);
 		if (!adapter) throw new Error(`no ${platform} adapter running`);
@@ -180,6 +251,8 @@ export class GatewayHost {
 				config: this.config,
 				state: this.state,
 				sessionDir: join(this.sessionsBase, dirSafe),
+				forwardDialog: (req) => this.forwardDialog(key, chatId, req),
+				forwardNotify: (message, notifyType) => this.forwardNotify(key, chatId, message, notifyType),
 				transport: {
 					send: (cid, text) => this.adapterFor(key.startsWith("discord:") ? "discord" : "telegram").send(cid, text),
 					edit: (cid, msgId, text) =>

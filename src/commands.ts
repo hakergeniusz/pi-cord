@@ -42,6 +42,10 @@ export function parseCommand(text: string): { command: string; args: string } | 
 export interface CommandContext {
 	config: PiCordConfig;
 	chat: ChatAgent;
+	/** Gateway key of this chat, so the gateway can cancel its pending dialogs. */
+	chatKey: string;
+	/** Cancel outstanding interactive dialogs of this chat (used by /stop). */
+	cancelDialogs: () => void;
 }
 
 export type CommandOutcome =
@@ -98,6 +102,7 @@ async function handleCommand(command: string, args: string, ctx: CommandContext,
 		}
 		case "stop": {
 			const stopped = await chat.stop();
+			ctx.cancelDialogs();
 			return { kind: "reply", text: stopped ? "⏹ Stopping…" : "Nothing is running." };
 		}
 		case "status":

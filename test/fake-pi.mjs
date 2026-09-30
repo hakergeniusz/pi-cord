@@ -30,6 +30,7 @@ if (!sessionFile || !existsSync(sessionFile)) sessionFile = newSessionFile();
 const stdin = process.stdin;
 let buffer = "";
 let lastPrompt = "";
+let lastFinal = "";
 let aborted = false;
 
 function send(obj) {
@@ -38,6 +39,39 @@ function send(obj) {
 
 function respond(id, command, success, data) {
 	send({ id: String(id), type: "response", command, success, ...(success ? { data } : { error: data }) });
+}
+
+/** Emit an extension dialog and wait for the extension_ui_response. */
+function askDialog(req) {
+	return new Promise((resolve) => {
+		dialogWaiters.set(req.id, resolve);
+		send({ type: "extension_ui_request", ...req });
+	});
+}
+
+const dialogWaiters = new Map();
+
+async function runDialogSequence(prompt) {
+	const select = await askDialog({
+		id: "dlg-select",
+		method: "select",
+		title: "Pick one",
+		options: ["Allow", "Block"],
+		timeout: 30000,
+	});
+	const confirm = await askDialog({
+		id: "dlg-confirm",
+		method: "confirm",
+		title: "Proceed?",
+		message: "This cannot be undone.",
+	});
+	const input = await askDialog({
+		id: "dlg-input",
+		method: "input",
+		title: "Type a number",
+		placeholder: "42",
+	});
+	return `Echo: ${prompt} [select=${select?.value ?? "cancelled"}] [confirm=${confirm?.confirmed ?? "cancelled"}] [input=${input?.value ?? "cancelled"}]`;
 }
 
 function state() {
@@ -58,6 +92,19 @@ function runAgent() {
 	send({ type: "turn_start" });
 	send({ type: "message_start", message: { role: "user", content: lastPrompt, timestamp: Date.now() } });
 	send({ type: "message_end", message: { role: "user", content: lastPrompt, timestamp: Date.now() } });
+
+	const withDialogs = lastPrompt.includes("test dialogs");
+	if (lastPrompt.startsWith("notify me")) {
+		send({ type: "extension_ui_request", id: `n-${Date.now()}`, method: "notify", message: "Background job finished", notifyType: "info" });
+	}
+	if (withDialogs) {
+		send({ type: "message_start", message: { role: "assistant", content: [], stopReason: "pending" } });
+		runDialogSequence(lastPrompt)
+			.then((finalText) => finishRun(finalText))
+			.catch(() => finishRun(`Echo: ${lastPrompt}`));
+		return;
+	}
+
 	send({ type: "message_start", message: { role: "assistant", content: [], stopReason: "pending" } });
 	send({
 		type: "tool_execution_start",
@@ -67,21 +114,32 @@ function runAgent() {
 	});
 	send({ type: "tool_execution_end", toolCallId: "call_1", toolName: "bash", result: { content: [{ type: "text", text: "hi" }], details: {} }, isError: false });
 	const delay = parseInt(process.env.FAKE_PI_DELAY ?? "150", 10);
-	setTimeout(() => {
-		send({
-			type: "message_update",
-			usage: { input: 1, output: 1, totalTokens: 2 },
-			assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: `Echo: ${lastPrompt}` },
-		});
-		send({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: `Echo: ${lastPrompt}` }], stopReason: "stop" } });
-		send({ type: "turn_end", message: { role: "assistant" }, toolResults: [] });
-		send({ type: "agent_end", messages: [], willRetry: false });
-		send({ type: "agent_settled" });
-	}, delay);
+	setTimeout(() => finishRun(`Echo: ${lastPrompt}`), delay);
+}
+
+function finishRun(finalText) {
+	lastFinal = finalText;
+	send({
+		type: "message_update",
+		usage: { input: 1, output: 1, totalTokens: 2 },
+		assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: finalText },
+	});
+	send({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: finalText }], stopReason: "stop" } });
+	send({ type: "turn_end", message: { role: "assistant" }, toolResults: [] });
+	send({ type: "agent_end", messages: [], willRetry: false });
+	send({ type: "agent_settled" });
 }
 
 function handle(cmd) {
 	const { id, type } = cmd;
+	if (type === "extension_ui_response") {
+		const waiter = dialogWaiters.get(String(id));
+		if (waiter) {
+			dialogWaiters.delete(String(id));
+			waiter(cmd);
+		}
+		return;
+	}
 	switch (type) {
 		case "get_state":
 			respond(id, type, true, state());
@@ -105,7 +163,7 @@ function handle(cmd) {
 			respond(id, type, true, {});
 			break;
 		case "get_last_assistant_text":
-			respond(id, type, true, { text: lastPrompt ? `Echo: ${lastPrompt}` : null });
+			respond(id, type, true, { text: lastFinal || (lastPrompt ? `Echo: ${lastPrompt}` : null) });
 			break;
 		case "get_session_stats":
 			respond(id, type, true, {

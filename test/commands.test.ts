@@ -40,6 +40,12 @@ function makeChat(key = "telegram:100"): ChatAgent {
 	});
 }
 
+function makeCtx(chat: ChatAgent) {
+	return { config, chat, chatKey: key, cancelDialogs: () => {} };
+}
+
+const key = "telegram:100";
+
 describe("parseCommand", () => {
 	test("plain command", () => {
 		expect(parseCommand("/new my session")).toEqual({ command: "new", args: "my session" });
@@ -67,12 +73,12 @@ describe("isAllowed", () => {
 
 describe("handleMessage", () => {
 	test("prompt from allowed user is submitted", async () => {
-		const outcome = await handleMessage(makeMsg(), { config, chat: makeChat() });
+		const outcome = await handleMessage(makeMsg(), makeCtx(makeChat()));
 		expect(outcome).toEqual({ kind: "prompt", text: "hello agent", images: [] });
 	});
 
 	test("unauthorized DM gets a denial with ids", async () => {
-		const outcome = await handleMessage(makeMsg({ userId: "999" }), { config, chat: makeChat() });
+		const outcome = await handleMessage(makeMsg({ userId: "999" }), makeCtx(makeChat()));
 		expect(outcome.kind).toBe("reply");
 		if (outcome.kind === "reply") {
 			expect(outcome.text).toContain("Not authorized");
@@ -81,31 +87,28 @@ describe("handleMessage", () => {
 	});
 
 	test("unauthorized group chatter is ignored", async () => {
-		const outcome = await handleMessage(makeMsg({ userId: "999", isDM: false }), { config, chat: makeChat() });
+		const outcome = await handleMessage(makeMsg({ userId: "999", isDM: false }), makeCtx(makeChat()));
 		expect(outcome.kind).toBe("ignored");
 	});
 
 	test("unauthorized user can still /id", async () => {
 		const outcome = await handleMessage(
 			makeMsg({ userId: "999", text: "/id", isCommand: true, command: "id" }),
-			{ config, chat: makeChat() },
+			makeCtx(makeChat()),
 		);
 		expect(outcome.kind).toBe("reply");
 		if (outcome.kind === "reply") expect(outcome.text).toContain("999");
 	});
 
 	test("/help works for allowed users", async () => {
-		const outcome = await handleMessage(makeMsg({ text: "/help", isCommand: true, command: "help" }), {
-			config,
-			chat: makeChat(),
-		});
+		const outcome = await handleMessage(makeMsg({ text: "/help", isCommand: true, command: "help" }), makeCtx(makeChat()));
 		expect(outcome.kind).toBe("reply");
 		if (outcome.kind === "reply") expect(outcome.text).toBe(HELP_TEXT);
 	});
 
 	test("unknown command errors, known child command passes through", async () => {
 		const chat = makeChat();
-		const unknown = await handleMessage(makeMsg({ text: "/nope", isCommand: true, command: "nope" }), { config, chat });
+		const unknown = await handleMessage(makeMsg({ text: "/nope", isCommand: true, command: "nope" }), makeCtx(chat));
 		expect(unknown.kind).toBe("reply");
 
 		// childCommandNames only consults a running child; stub it via a running child is
