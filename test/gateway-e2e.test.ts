@@ -150,6 +150,11 @@ describe("gateway end-to-end with fake pi", () => {
 		await adapter.inject({ text: "/new test-session", isCommand: true, command: "new" });
 		expect(adapter.sentTo("chan-1").at(-1)).toContain("test-session");
 
+		// Bare /new auto-names the session instead of requiring a name.
+		await adapter.inject({ text: "/new", isCommand: true, command: "new" });
+		const autoNamed = adapter.sentTo("chan-1").at(-1) ?? "";
+		expect(autoNamed).toMatch(/Started new session “chat \d{4}-\d{2}-\d{2} \d{2}:\d{2}” \(auto-named/);
+
 		await host.stop();
 	}, 30_000);
 

@@ -6,7 +6,7 @@ export const HELP_TEXT = [
 	"*pi-cord* — chat with your Pi coding agent.",
 	"",
 	"Commands:",
-	"/new [name] — start a fresh session",
+	"/new [name] — start a fresh session (auto-named when omitted)",
 	"/sessions — list recent sessions for this chat",
 	"/resume <n> — switch to session n",
 	"/stop — abort the current run",
@@ -25,7 +25,7 @@ export const HELP_TEXT = [
 
 /** Gateway built-ins, in menu order (Telegram command list / Discord slash commands). */
 export const GATEWAY_COMMANDS: SlashCommandInfo[] = [
-	{ name: "new", description: "Start a fresh agent session", source: "gateway" },
+	{ name: "new", description: "Start a fresh agent session (auto-named)", source: "gateway" },
 	{ name: "sessions", description: "List recent sessions for this chat", source: "gateway" },
 	{ name: "resume", description: "Switch to session n (see /sessions)", source: "gateway" },
 	{ name: "stop", description: "Abort the current run", source: "gateway" },

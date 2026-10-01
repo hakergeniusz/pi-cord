@@ -66,6 +66,13 @@ const PROGRESS_EDIT_INTERVAL = 4_000;
 const STREAM_EDIT_INTERVAL = 1_500;
 const TYPING_INTERVAL = 8_000;
 
+/** Friendly default session name for bare `/new`: "chat 2026-10-01 14:47" (server time). */
+function defaultSessionName(): string {
+	const d = new Date();
+	const p = (n: number) => String(n).padStart(2, "0");
+	return `chat ${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
 /**
  * One chat = one headless pi session (`pi --mode rpc` child process) with its
  * own --session-dir, so per-chat history is pi's own session storage. Prompts
@@ -499,9 +506,18 @@ export class ChatAgent {
 		const child = await this.ensureChild();
 		const res = await child.request<{ cancelled?: boolean }>({ type: "new_session" }, COMMAND_TIMEOUT);
 		if (res?.cancelled) return "Session switch was cancelled by an extension.";
-		if (name) await child.request({ type: "set_session_name", name }, COMMAND_TIMEOUT).catch(() => {});
+		// A name is optional: bare /new auto-names the session so /sessions stays
+		// readable instead of showing bare timestamp ids.
+		const resolved = name?.trim() || defaultSessionName();
+		const named = await child
+			.request({ type: "set_session_name", name: resolved }, COMMAND_TIMEOUT)
+			.then(() => true)
+			.catch(() => false);
 		await this.recordSessionFile();
-		return name ? `Started new session “${name}”.` : "Started new session.";
+		if (!named) return "Started new session.";
+		return name
+			? `Started new session “${resolved}”.`
+			: `Started new session “${resolved}” (auto-named — /new <name> to choose your own).`;
 	}
 
 	async listSessions(): Promise<string> {
